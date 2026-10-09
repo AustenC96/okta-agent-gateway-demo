@@ -30,7 +30,7 @@ discovered tools in the gateway's capability list is a good way to also show too
 cp .env.example .env
 ```
 Fill in `.env` from the component: `GATEWAY_URL` from **Deployment Data**, `CLIENT_ID` and `CLIENT_SECRET` from the
-**Credentials** panel, `OKTA_ORG_URL` from your org. Treat the client secret like a password.
+**Credentials** panel, `OKTA_ORG_URL` from your org (`https://<name>.oktapreview.com` or `https://<name>.okta.com`). Treat the client secret like a password.
 
 Optional: set `OKTA_API_TOKEN` (the token from Part 1 works) so the app can read Okta's System Log and turn the
 "Okta token exchange" and "GitHub token" stages green from real evidence. Without it those stages stay blue
