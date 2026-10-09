@@ -1,0 +1,66 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Okta Agent Gateway — Live Demo</title>
+<link rel="stylesheet" href="/styles.css">
+</head>
+<body>
+<header class="top">
+  <div class="brand">
+    <div class="logo"></div>
+    <div>
+      <h1>Agent Gateway</h1>
+      <p id="gwHost">connecting…</p>
+    </div>
+  </div>
+  <div class="who" id="who"></div>
+</header>
+
+<main>
+  <section class="left">
+    <ol class="steps" id="steps">
+      <li data-step="discover"><span class="n">1</span><div><b>Discover</b><small>Find how to authenticate</small></div></li>
+      <li data-step="login"><span class="n">2</span><div><b>Sign in</b><small>OAuth + PKCE through Okta</small></div></li>
+      <li data-step="session"><span class="n">3</span><div><b>Connect</b><small>Open an MCP session</small></div></li>
+      <li data-step="tools"><span class="n">4</span><div><b>Use tools</b><small>Call GitHub via the gateway</small></div></li>
+    </ol>
+
+    <div class="card" id="stage">
+      <div id="stageBody"></div>
+    </div>
+
+    <div class="card" id="flowCard">
+      <div class="flowHead">
+        <h3>Token flow</h3>
+        <button class="ghost" id="followBtn">Following live</button>
+      </div>
+      <svg id="dag" viewBox="0 0 560 372" role="img" aria-label="Token flow diagram"></svg>
+      <div class="legend">
+        <span><i class="sw done"></i>observed</span><span><i class="sw inferred"></i>inferred from Okta’s log</span>
+        <span><i class="sw waiting"></i>needs you</span><span><i class="sw error"></i>failed</span><span><i class="sw idle"></i>not reached</span>
+      </div>
+      <div id="flowDetail"></div>
+    </div>
+
+    <div class="card" id="resultCard" hidden>
+      <h3>Tool result</h3>
+      <div class="resultMeta" id="resultMeta"></div>
+      <pre id="resultBody"></pre>
+    </div>
+  </section>
+
+  <aside class="right">
+    <div class="panelHead">
+      <div><h2>Live trace</h2><span id="count">0 calls</span></div>
+      <div class="actions">
+        <button class="ghost" id="clearBtn">Clear</button>
+      </div>
+    </div>
+    <div id="feed"><div class="empty">Every HTTP call this app makes appears here the moment it happens, in the order they run (oldest at the top), with a plain-English explanation built from the real response. Click a call to see the raw request and response.</div></div>
+  </aside>
+</main>
+<script src="/app.js"></script>
+</body>
+</html>
