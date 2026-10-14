@@ -54,6 +54,8 @@ const summarizeLog = (e) => {
   const d = e.debugContext?.debugData || {};
   return {
     at: e.published, eventType: e.eventType, result: e.outcome?.result, reason: e.outcome?.reason || undefined,
+    user: (e.target || []).find((t) => t.type === 'User')?.alternateId || undefined,
+    userId: (e.target || []).find((t) => t.type === 'User')?.id || undefined,
     actor: e.actor?.alternateId && e.actor.alternateId !== 'unknown' ? e.actor.alternateId : e.actor?.id, actorType: e.actor?.type,
     message: e.displayMessage || undefined,
     tokenExchangeType: d.tokenExchangeType, clientAuthType: d.clientAuthType, subjectTokenClientId: d.subjectTokenClientId,
@@ -62,6 +64,45 @@ const summarizeLog = (e) => {
     targetResourceOrn: d.targetResourceOrn, persistedTokenTypes: d.persistedTokenTypes, grantType: d.grantType,
   };
 };
+
+// The client secret is POSTed to a URL that a remote server told us about, so every such URL is checked first.
+// Unless local hosts are allowed (local development), it must be https and must not point at a private, loopback,
+// link-local or cloud-metadata address. Only literal addresses and well-known names can be recognised here; a hostname
+// that merely resolves to a private address is not caught without a DNS lookup.
+export function safeUrl(raw, { allowLocal = false } = {}) {
+  let u; try { u = new URL(raw); } catch { return null; }
+  if (u.username || u.password) return null;
+  if (allowLocal) return ['http:', 'https:'].includes(u.protocol) ? u : null;
+  if (u.protocol !== 'https:') return null;
+  const h = u.hostname.toLowerCase().replace(/^\[|\]$/g, '');
+  if (h === 'localhost' || h.endsWith('.localhost') || h.endsWith('.internal') || h.endsWith('.local')) return null;
+  const v4 = h.match(/^(\d+)\.(\d+)\.(\d+)\.(\d+)$/);
+  if (v4) {
+    const [a, b] = [Number(v4[1]), Number(v4[2])];
+    if (a === 0 || a === 10 || a === 127 || (a === 169 && b === 254) || (a === 172 && b >= 16 && b <= 31) || (a === 192 && b === 168) || (a === 100 && b >= 64 && b <= 127) || a >= 224) return null;
+  } else if (h.includes(':')) {
+    if (h === '::1' || h === '::' || /^(fc|fd|fe[89ab])/.test(h) || h.startsWith('::ffff:')) return null;
+  } else if (/^\d+$/.test(h) || /^0x/i.test(h)) return null;
+  return u;
+}
+
+// Keeps the path of a callback URL but masks the one-time code and state in its query string.
+export function redactUrl(raw) {
+  try {
+    const u = new URL(raw, 'http://x');
+    for (const k of ['code', 'state']) if (u.searchParams.has(k)) u.searchParams.set(k, mask(u.searchParams.get(k), 4));
+    return u.pathname + (u.search ? decodeURIComponent(u.search) : '');
+  } catch { return String(raw).split('?')[0]; }
+}
+
+// Okta's System Log is org-wide, so a log entry is only shown to a visitor if it names that visitor. The exchange lists
+// the signed-in person as a User target (login in alternateId, Okta id in id); match either against the visitor's own
+// token claims. Fails closed: no identity, or an entry that names nobody, means no match.
+export function isMine(e, accessClaims, idClaims) {
+  const mine = new Set([accessClaims?.sub, accessClaims?.uid, idClaims?.sub, idClaims?.email, idClaims?.preferred_username]
+    .filter((x) => typeof x === 'string' && x).map((x) => x.toLowerCase()));
+  return [e?.user, e?.userId].some((x) => typeof x === 'string' && mine.has(x.toLowerCase()));
+}
 
 // Status of the two stages that happen inside Okta, from what Okta’s log said (pure, so it can be tested).
 export function stsStatus({ sts, consentUrl, callOk }) {
@@ -75,6 +116,7 @@ export function stsStatus({ sts, consentUrl, callOk }) {
 // so each call gets its own state and nothing leaks between instances.
 export function createApp(config) {
   const resolution = config.resolution || { strategy: 'none' };
+  const allowLocal = config.allowLocal ?? true; // local development: plain http and loopback hosts are fine
   // A tenant is one demo's settings. With no getTenant, the one configured tenant is served as 'default'.
   const staticTenant = config.gatewayUrl && { name: 'default', orgUrl: config.orgUrl, gatewayUrl: config.gatewayUrl, clientId: config.clientId, clientSecret: config.clientSecret, logToken: config.logToken, origin: config.origin };
   const rawTenant = config.getTenant || (async (name) => (name === 'default' ? staticTenant : null));
@@ -147,8 +189,16 @@ export function createApp(config) {
 
   // ---------- app ----------
   const app = express();
+  if (config.trustProxy) app.set('trust proxy', config.trustProxy);
   app.use(express.json());
-  app.use(session({ secret: crypto.randomBytes(32).toString('hex'), resave: false, saveUninitialized: true, cookie: { sameSite: 'lax' } }));
+  // Scripts and styles do not need a session, so serve them before it; the page itself is served after the tenant check below.
+  app.use(express.static(path.join(__dirname, 'public'), { index: false }));
+  app.use(session({
+    secret: config.sessionSecret || crypto.randomBytes(32).toString('hex'), resave: false, saveUninitialized: true,
+    cookie: { sameSite: 'lax', httpOnly: true, secure: !!config.origin && config.origin.startsWith('https:') },
+  }));
+  // Responses carry tokens and one-time codes, so they must never be cached by the browser or a proxy.
+  app.use('/api', (_req, res, next) => { res.set('Cache-Control', 'no-store'); next(); });
   // Resolve which demo this request is for. The OAuth callback always uses the tenant the sign-in started under,
   // never anything in its own query string, and switching demos drops the previous demo's tokens.
   const resetAuth = (req) => {
@@ -185,7 +235,7 @@ export function createApp(config) {
   app.get('/api/config', (req, res) => {
     const t = req.session.tokens;
     res.json({
-      gatewayUrl: req.tenant.gatewayUrl, orgUrl: req.tenant.orgUrl, clientId: req.tenant.clientId, redirectUri: req.tenant.redirectUri,
+      gatewayUrl: req.tenant.gatewayUrl,
       discovered: !!req.session.discovered && !!disc(req).asMeta, signedIn: !!t, tokenInfo: t ? tokenInfo(t) : null, mcpSessionId: req.session.mcpSessionId || null,
     });
   });
@@ -239,6 +289,7 @@ export function createApp(config) {
     const wa = probe.resHeaders['www-authenticate'] || '';
     const m = /resource_metadata="([^"]+)"/.exec(wa);
     const prUrl = m?.[1] || `${req.tenant.gatewayOrigin}/.well-known/oauth-protected-resource${req.tenant.gatewayPath}`;
+    if (!safeUrl(prUrl, { allowLocal })) return res.status(502).json({ error: 'The gateway pointed at a metadata URL that is not allowed' });
     const pr = await traced({
       sid: req.sessionID, step: 'discover', node: 'discover', label: 'Read the gateway’s protected-resource metadata', url: prUrl,
       narrate: ({ ev, parsed }) => ev.error ? `Metadata fetch failed: ${ev.error}.` : ev.response.status !== 200 ? `Metadata endpoint returned ${ev.response.status}.`
@@ -248,14 +299,22 @@ export function createApp(config) {
     d.prMeta = pr.parsed;
     const asBase = d.prMeta?.authorization_servers?.[0];
     if (!asBase) return res.status(502).json({ error: 'No authorization server advertised by gateway' });
+    const asUrl = safeUrl(asBase, { allowLocal });
+    if (!asUrl) return res.status(502).json({ error: 'The advertised authorization server is not an allowed address' });
+    if (!allowLocal && asUrl.origin !== new URL(req.tenant.orgUrl).origin && !(req.tenant.authOrigins || []).includes(asUrl.origin)) {
+      return res.status(502).json({ error: 'The advertised authorization server is not this tenant’s Okta org' });
+    }
     const as = await traced({
       sid: req.sessionID, step: 'discover', node: 'discover', label: 'Read the authorization server’s metadata', url: `${asBase}/.well-known/oauth-authorization-server`,
       narrate: ({ ev, parsed }) => ev.error ? `Failed: ${ev.error}.` : ev.response.status !== 200 ? `Returned ${ev.response.status}.`
         : `This is a dedicated Okta custom authorization server created for the gateway. It supports ${(parsed.grant_types_supported || []).length} grant types and PKCE methods ${(parsed.code_challenge_methods_supported || []).join(', ')}. We will use the authorization endpoint ${new URL(parsed.authorization_endpoint).pathname} and token endpoint ${new URL(parsed.token_endpoint).pathname}.`,
     });
-    d.asMeta = as.parsed;
-    req.session.discovered = !!d.asMeta?.authorization_endpoint;
-    res.json({ ok: !!d.asMeta?.authorization_endpoint });
+    // Endpoints must stay on the authorization server we vetted: the token endpoint receives the client secret.
+    const sameOrigin = (x) => { const v = safeUrl(x, { allowLocal }); return !!v && v.origin === asUrl.origin; };
+    const okMeta = !!as.parsed && sameOrigin(as.parsed.authorization_endpoint) && sameOrigin(as.parsed.token_endpoint);
+    d.asMeta = okMeta ? as.parsed : null;
+    req.session.discovered = okMeta;
+    res.json({ ok: okMeta });
   });
 
   // Step 2: authorization code + PKCE
@@ -288,11 +347,13 @@ export function createApp(config) {
     const saved = req.session.pkce;
     const { asMeta } = disc(req);
     if (error) {
-      emit(req.sessionID, { step: 'login', label: 'Okta returned an error', method: 'GET', url: req.originalUrl, request: { headers: {} }, response: { status: 400, body: { error, error_description } }, ms: 0, outcome: 'denied', narration: `Okta refused the sign-in: ${error}${error_description ? ` — ${error_description}` : ''}. Nothing was issued.` });
+      emit(req.sessionID, { step: 'login', label: 'Okta returned an error', method: 'GET', url: redactUrl(req.originalUrl), request: { headers: {} }, response: { status: 400, body: { error, error_description } }, ms: 0, outcome: 'denied', narration: `Okta refused the sign-in: ${error}${error_description ? ` — ${error_description}` : ''}. Nothing was issued.` });
       return res.redirect('/');
     }
-    if (!saved || state !== saved.state) {
-      emit(req.sessionID, { step: 'login', label: 'State mismatch', method: 'GET', url: req.originalUrl, request: { headers: {} }, response: { status: 400 }, ms: 0, outcome: 'denied', narration: 'The state value that came back did not match the one we sent. This is the CSRF check, so the response was discarded.' });
+    const stateOk = !!saved && typeof state === 'string' && state.length === saved.state.length
+      && crypto.timingSafeEqual(Buffer.from(state), Buffer.from(saved.state));
+    if (!stateOk) {
+      emit(req.sessionID, { step: 'login', label: 'State mismatch', method: 'GET', url: redactUrl(req.originalUrl), request: { headers: {} }, response: { status: 400 }, ms: 0, outcome: 'denied', narration: 'The state value that came back did not match the one we sent. This is the CSRF check, so the response was discarded.' });
       return res.redirect('/');
     }
     F(req).code = code;
@@ -406,6 +467,10 @@ export function createApp(config) {
   async function collectSts(req, sinceMs, tool) {
     if (!req.tenant.logToken) return;
     const sid = req.sessionID;
+    // Okta's log is org-wide, so only accept exchanges that name this session's user. Fail closed: with no identity, no evidence.
+    const idc = req.session.tokens?.id_token ? decodeJwt(req.session.tokens.id_token)?.claims : null;
+    const ac = decodeJwt(req.session.tokens?.access_token)?.claims;
+    const mine = (e) => isMine(e, ac, idc);
     const hdr = { Authorization: `SSWS ${req.tenant.logToken}`, Accept: 'application/json' };
     const q = (extra) => `${req.tenant.orgUrl}/api/v1/logs?${new URLSearchParams({ limit: '100', ...extra })}`;
     const get = async (url) => {
@@ -422,10 +487,10 @@ export function createApp(config) {
         win = await get(q({ since: new Date(sinceMs - 5000).toISOString(), sortOrder: 'ASCENDING', filter: `eventType sw "${STS_EVENT}" or eventType sw "agent_gateway.mcp"` }));
         if (win.some((e) => e.eventType === 'agent_gateway.mcp.tool.call')) break;
       }
-      const exchange = [...win].reverse().find((e) => e.eventType === STS_EVENT) || null;
+      const exchange = [...win].reverse().find((e) => e.eventType === STS_EVENT && mine(e)) || null;
       // No fresh exchange means the gateway may have reused a downstream token it already held; find the latest one for this agent.
-      const latest = exchange ? null : (await get(q({ since: new Date(Date.now() - 864e5).toISOString(), sortOrder: 'DESCENDING', limit: '20', filter: `eventType sw "${STS_EVENT}"` }))).find((e) => e.subjectTokenClientId === req.tenant.clientId) || null;
-      const consent = (await get(q({ since: new Date(Date.now() - 7 * 864e5).toISOString(), sortOrder: 'DESCENDING', limit: '1', filter: 'eventType eq "app.oauth2.token.oauth_sts.request_token"' })))[0] || null;
+      const latest = exchange ? null : (await get(q({ since: new Date(Date.now() - 864e5).toISOString(), sortOrder: 'DESCENDING', limit: '20', filter: `eventType sw "${STS_EVENT}"` }))).find((e) => e.subjectTokenClientId === req.tenant.clientId && mine(e)) || null;
+      const consent = (await get(q({ since: new Date(Date.now() - 7 * 864e5).toISOString(), sortOrder: 'DESCENDING', limit: '20', filter: 'eventType eq "app.oauth2.token.oauth_sts.request_token"' }))).find(mine) || null;
       stsEvidence.set(sid, { exchange, latest, reused: !exchange && !!latest, consent, window: win, checkedAt: new Date().toISOString(), tool });
       const t = (iso) => new Date(iso).toLocaleTimeString();
       const gw = win.filter((e) => e.eventType.startsWith('agent_gateway.'));
@@ -498,6 +563,8 @@ if (process.argv[1] && import.meta.url === pathToFileURL(process.argv[1]).href) 
     }
     origin = u.origin;
   }
-  const config = { origin, orgUrl: OKTA_ORG_URL, gatewayUrl: GATEWAY_URL, clientId: CLIENT_ID, clientSecret: CLIENT_SECRET, logToken: process.env.OKTA_API_TOKEN, port: PORT };
+  const local = !origin || ['localhost', '127.0.0.1'].includes(new URL(origin).hostname);
+  const tp = process.env.TRUST_PROXY;
+  const config = { origin, allowLocal: local, sessionSecret: process.env.SESSION_SECRET, trustProxy: tp ? (/^\d+$/.test(tp) ? Number(tp) : tp) : undefined, orgUrl: OKTA_ORG_URL, gatewayUrl: GATEWAY_URL, clientId: CLIENT_ID, clientSecret: CLIENT_SECRET, logToken: process.env.OKTA_API_TOKEN, port: PORT };
   createApp(config).listen(PORT, () => console.log(`Agent Gateway demo listening on port ${PORT}, public address ${origin || `http://localhost:${PORT}`}`));
 }

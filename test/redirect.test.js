@@ -26,17 +26,17 @@ function gateway() {
 function rawGet(base, path, host, cookie) {
   return new Promise((resolve, reject) => {
     const u = new URL(base);
-    const r = http.request({ host: u.hostname, port: u.port, path, headers: { host, ...(cookie ? { cookie } : {}) } }, (res) => { res.resume(); res.on('end', () => resolve(res)); });
+    const r = http.request({ host: u.hostname, port: u.port, path, headers: { host, 'x-forwarded-proto': 'https', ...(cookie ? { cookie } : {}) } }, (res) => { res.resume(); res.on('end', () => resolve(res)); });
     r.on('error', reject); r.end();
   });
 }
 
 test('the redirect URI comes from configuration, never from the Host header', async () => {
   const gw = await gateway();
-  const app = await startApp({ gatewayUrl: gw.url, origin: 'https://demo.example.com' });
+  const app = await startApp({ gatewayUrl: gw.url, origin: 'https://demo.example.com', trustProxy: 1 });
   try {
     // one discovered session, then ask for login with an honest Host and with a spoofed one
-    const disc = await fetch(app.base + '/api/discover', { method: 'POST' });
+    const disc = await fetch(app.base + '/api/discover', { method: 'POST', headers: { 'x-forwarded-proto': 'https' } });
     const cookie = disc.headers.getSetCookie()[0].split(';')[0];
     const honest = await rawGet(app.base, '/auth/login', new URL(app.base).host, cookie);
     const spoofed = await rawGet(app.base, '/auth/login', 'evil.example.net', cookie);
@@ -45,16 +45,14 @@ test('the redirect URI comes from configuration, never from the Host header', as
       assert.equal(new URL(r.headers.location).searchParams.get('redirect_uri'), 'https://demo.example.com/authorization-code/callback');
       assert.ok(!r.headers.location.includes('evil.example.net'));
     }
-    const cfg = await (await fetch(app.base + '/api/config', { headers: { cookie } })).json();
-    assert.equal(cfg.redirectUri, 'https://demo.example.com/authorization-code/callback');
   } finally { await app.close(); await gw.close(); }
 });
 
 test('the token exchange sends exactly the redirect_uri that /authorize used', async () => {
   const gw = await gateway();
-  const app = await startApp({ gatewayUrl: gw.url, origin: 'https://demo.example.com' });
+  const app = await startApp({ gatewayUrl: gw.url, origin: 'https://demo.example.com', trustProxy: 1 });
   try {
-    const b = browser(app.base);
+    const b = browser(app.base, { 'x-forwarded-proto': 'https' });
     await b('/api/discover', { method: 'POST' });
     const login = await b('/auth/login');
     const u = new URL(login.headers.get('location'));
@@ -77,4 +75,12 @@ test('a wrong state is refused without calling the token endpoint', async () => 
     await b('/authorization-code/callback?code=abc&state=not-the-state');
     assert.equal(gw.seen.tokenForms.length, 0);
   } finally { await app.close(); await gw.close(); }
+});
+
+test('with an https public address, no session cookie is issued over plain http (secure cookie)', async () => {
+  const app = await startApp({ origin: 'https://demo.example.com' });
+  try {
+    const res = await fetch(app.base + '/api/config');
+    assert.equal(res.headers.get('set-cookie'), null);
+  } finally { await app.close(); }
 });

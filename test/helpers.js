@@ -13,10 +13,10 @@ export async function startApp(overrides = {}) {
 }
 
 // A minimal cookie jar so one test can act as two separate browsers.
-export function browser(base) {
+export function browser(base, extraHeaders = {}) {
   let cookie = '';
   return async (path, init = {}) => {
-    const res = await fetch(base + path, { ...init, redirect: 'manual', headers: { ...(init.headers || {}), ...(cookie ? { cookie } : {}) } });
+    const res = await fetch(base + path, { ...init, redirect: 'manual', headers: { ...extraHeaders, ...(init.headers || {}), ...(cookie ? { cookie } : {}) } });
     const set = res.headers.getSetCookie?.()[0];
     if (set) cookie = set.split(';')[0];
     return res;
