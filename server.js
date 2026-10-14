@@ -5,6 +5,7 @@ import crypto from 'node:crypto';
 import path from 'node:path';
 import { fileURLToPath, pathToFileURL } from 'node:url';
 import { tenantNameFrom } from './tenant.js';
+import { createMemoryStore } from './store.js';
 import { createBootstrap, toTenant } from './bootstrap.js';
 import { createHooks } from './hooks.js';
 
@@ -131,27 +132,18 @@ export function createApp(config) {
   };
 
   // ---------- event log (every real HTTP call lands here) ----------
-  // One bucket per browser session, so a visitor only ever sees their own calls.
-  const buckets = new Map();
-  const bucket = (sid) => {
-    let b = buckets.get(sid);
-    if (!b) buckets.set(sid, b = { events: [], listeners: new Set(), seq: 0, lastSeen: Date.now() });
-    b.lastSeen = Date.now();
-    return b;
-  };
-  function emit(sid, ev) {
-    const b = bucket(sid);
-    ev.id = ++b.seq;
+  // Events live in the store, one trace per browser session, so a visitor only ever sees their own calls and the trace
+  // survives across server instances when the store is shared. Streaming listeners are in-process by nature.
+  const store = config.store || createMemoryStore();
+  const defer = config.defer || ((p) => p.catch(() => {}));
+  const listeners = new Map(); // sid -> Set of send(ev) functions
+  async function emit(sid, ev) {
     ev.ts = new Date().toISOString();
-    b.events.push(ev);
-    if (b.events.length > 500) b.events.shift();
-    for (const res of b.listeners) res.write(`data: ${JSON.stringify(ev)}\n\n`);
+    await store.append(sid, ev);
+    for (const send of listeners.get(sid) || []) send(ev);
     return ev;
   }
-  // Drop buckets nobody has touched for an hour and that have no open stream.
-  setInterval(() => {
-    for (const [sid, b] of buckets) if (!b.listeners.size && Date.now() - b.lastSeen > 3600e3) buckets.delete(sid);
-  }, 600e3).unref();
+  const wrap = (fn) => (req, res, next) => Promise.resolve(fn(req, res, next)).catch(next);
 
   // A traced fetch: performs the real request and emits a structured event.
   async function traced({ sid, step, node, label, method = 'GET', url, headers = {}, body, form, narrate }) {
@@ -185,12 +177,18 @@ export function createApp(config) {
     };
     ev.narration = narrate ? narrate({ ev, res, parsed, resHeaders }) : defaultNarration(ev);
     ev.outcome = error ? 'error' : res.status < 300 ? 'ok' : res.status === 401 || res.status === 403 || res.status === 400 ? 'denied' : 'error';
-    emit(sid, ev);
+    await emit(sid, ev);
     return { res, parsed, resHeaders, ev };
   }
 
   // ---------- app ----------
   const app = express();
+  // Express 4 ignores promise rejections from async handlers, which would hang the request (or crash the process) when the
+  // store is a network service. Route every handler through one place that hands failures to the error middleware.
+  for (const m of ['get', 'post']) {
+    const orig = app[m].bind(app);
+    app[m] = (path, ...fns) => (fns.length ? orig(path, ...fns.map((f) => (req, res, next) => Promise.resolve(f(req, res, next)).catch(next))) : orig(path));
+  }
   if (config.trustProxy) app.set('trust proxy', config.trustProxy);
   // Platform webhooks carry no cookie and name their own demo, so they sit before the session and tenant middleware.
   if (config.hooks) app.use('/hooks', config.hooks);
@@ -198,16 +196,16 @@ export function createApp(config) {
   // Scripts and styles do not need a session, so serve them before it; the page itself is served after the tenant check below.
   app.use(express.static(path.join(__dirname, 'public'), { index: false }));
   app.use(session({
-    secret: config.sessionSecret || crypto.randomBytes(32).toString('hex'), resave: false, saveUninitialized: true,
+    store: store.sessionStore(), secret: config.sessionSecret || crypto.randomBytes(32).toString('hex'), resave: false, saveUninitialized: true,
     cookie: { sameSite: 'lax', httpOnly: true, secure: !!config.origin && config.origin.startsWith('https:') },
   }));
   // Responses carry tokens and one-time codes, so they must never be cached by the browser or a proxy.
   app.use('/api', (_req, res, next) => { res.set('Cache-Control', 'no-store'); next(); });
   // Resolve which demo this request is for. The OAuth callback always uses the tenant the sign-in started under,
   // never anything in its own query string, and switching demos drops the previous demo's tokens.
-  const resetAuth = (req) => {
+  const resetAuth = async (req) => {
     Object.assign(req.session, { tokens: null, mcpSessionId: null, pkce: null, discovered: false, returnedFromOkta: false, flow: null });
-    stsEvidence.delete(req.sessionID);
+    await store.drop('sts:' + req.sessionID);
   };
   app.use(async (req, res, next) => {
     try {
@@ -220,7 +218,7 @@ export function createApp(config) {
       }
       const tenant = await getTenant(name);
       if (!tenant) return res.status(404).json({ error: 'Unknown demo' });
-      if (req.session.tenant && req.session.tenant !== name) resetAuth(req);
+      if (req.session.tenant && req.session.tenant !== name) await resetAuth(req);
       req.session.tenant = name;
       req.tenant = tenant;
       next();
@@ -230,7 +228,6 @@ export function createApp(config) {
 
   // Okta System Log evidence arrives seconds after the HTTP response is sent, and express-session only saves at response time,
   // so anything written later would be lost. Keep it here, keyed by session id.
-  const stsEvidence = new Map();
   const F = (req) => (req.session.flow ||= { gateway: { calls: [] }, toolCalls: [], sts: null, stsConsent: null });
   // Public metadata the gateway published, cached per tenant so one demo's discovery never answers for another's.
   const discovery = new Map();
@@ -252,28 +249,49 @@ export function createApp(config) {
     };
   }
 
+  // How the browser should follow the trace: a long-lived stream, or short polls (serverless hosts cannot hold a stream open).
+  app.get('/api/transport', (_req, res) => res.json({ mode: config.transport === 'poll' ? 'poll' : 'stream' }));
+
+  // Polling form: returns what happened after a given id. With init=1 it only reports the current position, so a fresh page
+  // load starts empty exactly like the stream does.
+  app.get('/api/events/poll', wrap(async (req, res) => {
+    const sid = req.sessionID;
+    if (req.query.init) return res.json({ events: [], head: await store.head(sid) });
+    const after = Number(req.query.after) || 0;
+    const events = await store.list(sid, after);
+    res.json({ events, head: events.length ? events[events.length - 1].id : after });
+  }));
+
   // live event stream (new events only; the feed starts empty on every page load)
-  app.get('/api/events', (req, res) => {
+  app.get('/api/events', wrap(async (req, res) => {
     res.set({ 'Content-Type': 'text/event-stream', 'Cache-Control': 'no-cache', Connection: 'keep-alive' });
     res.flushHeaders();
+    const sid = req.sessionID;
+    const send = (ev) => res.write(`data: ${JSON.stringify(ev)}\n\n`);
+    // Subscribe before replaying so nothing slips between the two; ids let the client ignore any overlap.
+    const set = listeners.get(sid) || listeners.set(sid, new Set()).get(sid);
+    let replaying = true; const queued = []; let top = 0;
+    const live = (ev) => { if (replaying) queued.push(ev); else if (ev.id > top) { top = ev.id; send(ev); } };
+    set.add(live);
+    const ping = setInterval(() => res.write(': ping\n\n'), 15000);
+    req.on('close', () => { clearInterval(ping); set.delete(live); if (!set.size) listeners.delete(sid); });
     // A fresh page load starts empty. The only exception is returning from the Okta redirect:
     // the client passes ?after=<last id it showed> so it receives just the calls it missed.
     const after = Number(req.query.after);
-    const b = bucket(req.sessionID);
-    if (Number.isFinite(after)) for (const ev of b.events) if (ev.id > after) res.write(`data: ${JSON.stringify(ev)}\n\n`);
-    b.listeners.add(res);
-    const ping = setInterval(() => res.write(': ping\n\n'), 15000);
-    req.on('close', () => { clearInterval(ping); b.listeners.delete(res); });
-  });
+    top = Number.isFinite(after) ? after : await store.head(sid);
+    if (Number.isFinite(after)) for (const ev of await store.list(sid, after)) { top = Math.max(top, ev.id); send(ev); }
+    replaying = false;
+    for (const ev of queued) if (ev.id > top) { top = ev.id; send(ev); }
+  }));
   // Called on every page load. Coming back from Okta keeps the walkthrough where it was (the callback set
   // returnedFromOkta); any other load, such as a manual refresh, restarts it at step 1.
-  app.post('/api/page-load', (req, res) => {
+  app.post('/api/page-load', wrap(async (req, res) => {
     const returned = !!req.session.returnedFromOkta;
     req.session.returnedFromOkta = false;
-    if (!returned) { req.session.discovered = false; req.session.flow = null; stsEvidence.delete(req.sessionID); }
+    if (!returned) { req.session.discovered = false; req.session.flow = null; await store.drop('sts:' + req.sessionID); }
     res.json({ returned });
-  });
-  app.post('/api/events/clear', (req, res) => { bucket(req.sessionID).events.length = 0; res.json({ ok: true }); });
+  }));
+  app.post('/api/events/clear', wrap(async (req, res) => { await store.clear(req.sessionID); res.json({ ok: true }); }));
 
   // Step 1: discovery. First poke the gateway with no credentials, then follow what it tells us.
   app.post('/api/discover', async (req, res) => {
@@ -335,7 +353,7 @@ export function createApp(config) {
     const u = new URL(asMeta.authorization_endpoint);
     Object.entries({ client_id: req.tenant.clientId, response_type: 'code', redirect_uri: req.tenant.redirectUri, scope, state, code_challenge: challenge, code_challenge_method: 'S256', resource: req.tenant.gatewayUrl })
       .forEach(([k, v]) => u.searchParams.set(k, v));
-    emit(req.sessionID, {
+    await emit(req.sessionID, {
       step: 'login', node: 'pkce', label: 'Send the user to Okta to sign in', method: 'GET (browser redirect)', url: u.toString().replace(/code_challenge=[^&]+/, 'code_challenge=' + mask(challenge)),
       request: { headers: {}, body: { response_type: 'code', scope, code_challenge_method: 'S256', code_challenge: mask(challenge), state: mask(state), resource: req.tenant.gatewayUrl } },
       response: null, ms: 0, outcome: 'ok',
@@ -351,17 +369,17 @@ export function createApp(config) {
     const saved = req.session.pkce;
     const { asMeta } = disc(req);
     if (error) {
-      emit(req.sessionID, { step: 'login', label: 'Okta returned an error', method: 'GET', url: redactUrl(req.originalUrl), request: { headers: {} }, response: { status: 400, body: { error, error_description } }, ms: 0, outcome: 'denied', narration: `Okta refused the sign-in: ${error}${error_description ? ` — ${error_description}` : ''}. Nothing was issued.` });
+      await emit(req.sessionID, { step: 'login', label: 'Okta returned an error', method: 'GET', url: redactUrl(req.originalUrl), request: { headers: {} }, response: { status: 400, body: { error, error_description } }, ms: 0, outcome: 'denied', narration: `Okta refused the sign-in: ${error}${error_description ? ` — ${error_description}` : ''}. Nothing was issued.` });
       return res.redirect('/');
     }
     const stateOk = !!saved && typeof state === 'string' && state.length === saved.state.length
       && crypto.timingSafeEqual(Buffer.from(state), Buffer.from(saved.state));
     if (!stateOk) {
-      emit(req.sessionID, { step: 'login', label: 'State mismatch', method: 'GET', url: redactUrl(req.originalUrl), request: { headers: {} }, response: { status: 400 }, ms: 0, outcome: 'denied', narration: 'The state value that came back did not match the one we sent. This is the CSRF check, so the response was discarded.' });
+      await emit(req.sessionID, { step: 'login', label: 'State mismatch', method: 'GET', url: redactUrl(req.originalUrl), request: { headers: {} }, response: { status: 400 }, ms: 0, outcome: 'denied', narration: 'The state value that came back did not match the one we sent. This is the CSRF check, so the response was discarded.' });
       return res.redirect('/');
     }
     F(req).code = code;
-    emit(req.sessionID, {
+    await emit(req.sessionID, {
       step: 'login', node: 'code', label: 'Okta sent the user back with an authorization code', method: 'GET (browser redirect)', url: `${req.tenant.origin}/authorization-code/callback`,
       request: { headers: {}, body: { code: mask(code), state: mask(state) } }, response: null, ms: 0, outcome: 'ok',
       narration: 'The user signed in and Okta redirected the browser back with a one-time authorization code. The code is useless on its own: it can only be redeemed together with the PKCE secret that only this app holds, and only once.',
@@ -384,9 +402,9 @@ export function createApp(config) {
     res.redirect('/');
   });
 
-  app.post('/api/logout', (req, res) => {
-    resetAuth(req);
-    const b = bucket(req.sessionID); b.events.length = 0; b.seq = 0;
+  app.post('/api/logout', async (req, res) => {
+    await resetAuth(req);
+    await store.clear(req.sessionID, { resetSeq: true });
     res.json({ ok: true });
   });
 
@@ -410,7 +428,7 @@ export function createApp(config) {
         authorization: redactHeaders({ authorization: headers.Authorization }).authorization };
       F(req).gateway.calls.push(rec);
       if (method === 'tools/call') F(req).toolCalls.push(rec);
-      if (method === 'tools/call' && status === 200) collectSts(req, startedAt, params?.name); // fire and forget: the log lags a couple of seconds
+      if (method === 'tools/call' && status === 200) defer(collectSts(req, startedAt, params?.name)); // runs after the response: the log lags a couple of seconds
     }
     return { status: r.res?.status ?? 502, body: r.parsed, error: r.ev.error };
   }
@@ -495,7 +513,7 @@ export function createApp(config) {
       // No fresh exchange means the gateway may have reused a downstream token it already held; find the latest one for this agent.
       const latest = exchange ? null : (await get(q({ since: new Date(Date.now() - 864e5).toISOString(), sortOrder: 'DESCENDING', limit: '20', filter: `eventType sw "${STS_EVENT}"` }))).find((e) => e.subjectTokenClientId === req.tenant.clientId && mine(e)) || null;
       const consent = (await get(q({ since: new Date(Date.now() - 7 * 864e5).toISOString(), sortOrder: 'DESCENDING', limit: '20', filter: 'eventType eq "app.oauth2.token.oauth_sts.request_token"' }))).find(mine) || null;
-      stsEvidence.set(sid, { exchange, latest, reused: !exchange && !!latest, consent, window: win, checkedAt: new Date().toISOString(), tool });
+      await store.put('sts:' + sid, { exchange, latest, reused: !exchange && !!latest, consent, window: win, checkedAt: new Date().toISOString(), tool });
       const t = (iso) => new Date(iso).toLocaleTimeString();
       const gw = win.filter((e) => e.eventType.startsWith('agent_gateway.'));
       const consentLine = consent ? ` No consent prompt was needed: you had already authorized GitHub at ${t(consent.at)} and Okta stored the token pair (${consent.persistedTokenTypes || 'access + refresh'}). Okta’s log doesn’t say outright that it was reused, so that part is inferred.` : '';
@@ -507,23 +525,23 @@ export function createApp(config) {
       } else {
         narration = `The call succeeded, so the gateway must have used a GitHub token, but Okta’s log shows no token exchange for this agent in the last 24 hours. The log can lag; this stays “inferred” until a record appears.`;
       }
-      emit(sid, {
+      await emit(sid, {
         step: 'mcp', node: 'sts', label: 'Okta System Log: the token exchange behind that call', method: 'GET', url: `${req.tenant.orgUrl}/api/v1/logs`,
         request: { headers: redactHeaders(hdr), body: { since: new Date(sinceMs - 5000).toISOString(), filter: 'token exchange + agent_gateway events' } },
         response: { status: 200, body: { exchange, mostRecentExchange: latest, gatewayEvents: gw, githubConsentOnFile: consent } },
         ms: Date.now() - started, outcome: exchange && exchange.result !== 'SUCCESS' ? 'error' : 'ok', narration,
       });
     } catch (e) {
-      emit(sid, { step: 'mcp', node: 'sts', label: 'Okta System Log lookup failed', method: 'GET', url: `${req.tenant.orgUrl}/api/v1/logs`, request: { headers: redactHeaders(hdr) }, response: null, ms: Date.now() - started, error: String(e.message || e), outcome: 'error', narration: `Could not read Okta’s System Log: ${e.message}. The exchange still happened; only the evidence is missing.` });
+      await emit(sid, { step: 'mcp', node: 'sts', label: 'Okta System Log lookup failed', method: 'GET', url: `${req.tenant.orgUrl}/api/v1/logs`, request: { headers: redactHeaders(hdr) }, response: null, ms: Date.now() - started, error: String(e.message || e), outcome: 'error', narration: `Could not read Okta’s System Log: ${e.message}. The exchange still happened; only the evidence is missing.` });
     }
   }
 
-  app.get('/api/flow', (req, res) => {
+  app.get('/api/flow', async (req, res) => {
     const s = req.session, fl = s.flow || {}, t = s.tokens, g = fl.gateway?.calls || [], last = g[g.length - 1];
     const gOk = g.some((c) => c.status === 200 && !c.rpcError);
     const callOk = (fl.toolCalls || []).some((c) => c.ok);
     const consentUrl = last?.consentUrl || null;
-    const ev = stsEvidence.get(req.sessionID) || null;
+    const ev = await store.take('sts:' + req.sessionID);
     const stsS = stsStatus({ sts: ev, consentUrl, callOk });
     const ghRec = ev?.exchange || ev?.latest || null;
     const dec = t ? decodeJwt(t.access_token) : null, idDec = t?.id_token ? decodeJwt(t.id_token) : null;
@@ -546,6 +564,11 @@ export function createApp(config) {
     res.json({ nodes });
   });
 
+  // Never leak internals: log server-side, answer generically.
+  app.use((err, _req, res, _next) => {
+    console.error('request failed:', err?.message || err);
+    if (!res.headersSent) res.status(500).json({ error: 'Something went wrong' });
+  });
   return app;
 }
 
