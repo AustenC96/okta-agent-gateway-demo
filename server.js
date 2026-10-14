@@ -6,8 +6,8 @@ import path from 'node:path';
 import { fileURLToPath, pathToFileURL } from 'node:url';
 import { tenantNameFrom } from './tenant.js';
 import { createMemoryStore } from './store.js';
-import { createBootstrap, toTenant } from './bootstrap.js';
-import { createHooks } from './hooks.js';
+import { configFromEnv } from './config.js';
+import { Redis } from '@upstash/redis';
 
 const __dirname = path.dirname(fileURLToPath(import.meta.url));
 
@@ -572,41 +572,12 @@ export function createApp(config) {
   return app;
 }
 
-// Run as a server only when executed directly (npm start), not when imported by tests.
+// Run as a server only when executed directly (npm start), not when imported by tests or by the Vercel function.
 if (process.argv[1] && import.meta.url === pathToFileURL(process.argv[1]).href) {
   dotenv.config();
-  const { OKTA_ORG_URL, GATEWAY_URL, CLIENT_ID, CLIENT_SECRET, PORT = 8080, DEMO_API_APP_ID, DEMO_API_CLIENT_ID, DEMO_API_CLIENT_SECRET } = process.env;
-  // Multi-tenant mode (hosted on the demo platform) is on when the Bootstrap credentials are present; otherwise the one
-  // org in the environment is served, exactly as before.
-  const multi = !!DEMO_API_APP_ID;
-  const need = multi ? { DEMO_API_APP_ID, DEMO_API_CLIENT_ID, DEMO_API_CLIENT_SECRET, BASE_URI: process.env.BASE_URI } : { OKTA_ORG_URL, GATEWAY_URL, CLIENT_ID, CLIENT_SECRET };
-  for (const [k, v] of Object.entries(need)) {
-    if (!v) { console.error(`Missing ${k}. Copy .env.example to .env and fill it in (see README.md)`); process.exit(1); }
-  }
-  // The public address of this app. It is never taken from request headers, because Okta needs the exact value
-  // registered on the OIDC app and a spoofed Host header must not be able to change it.
-  let origin = process.env.BASE_URI ? process.env.BASE_URI.replace(/\/+$/, '') : undefined;
-  if (origin) {
-    let u; try { u = new URL(origin); } catch { /* handled below */ }
-    if (!u || !['http:', 'https:'].includes(u.protocol) || u.pathname !== '/' || u.search || u.hash || (u.protocol === 'http:' && !['localhost', '127.0.0.1'].includes(u.hostname))) {
-      console.error('BASE_URI must be an https origin such as https://demo.example.com (http is allowed only for localhost)'); process.exit(1);
-    }
-    origin = u.origin;
-  }
-  const local = !origin || ['localhost', '127.0.0.1'].includes(new URL(origin).hostname);
-  const tp = process.env.TRUST_PROXY;
-  let multiConfig = {};
-  if (multi) {
-    const bootstrap = createBootstrap({ appId: DEMO_API_APP_ID, clientId: DEMO_API_CLIENT_ID, clientSecret: DEMO_API_CLIENT_SECRET, cacheMinutes: Number(process.env.CACHE_DURATION) || 60 });
-    const strategy = process.env.RESOLUTION_STRATEGY || 'query';
-    if (!['query', 'subdomain'].includes(strategy)) { console.error('RESOLUTION_STRATEGY must be query or subdomain'); process.exit(1); }
-    multiConfig = {
-      resolution: { strategy, baseHost: new URL(origin).hostname },
-      getTenant: async (name) => (name === 'default' ? null : toTenant(await bootstrap.get(name))),
-      // Changes inside a demo's Okta org stay off until Demo Engineering confirms which client and scopes we may use.
-      hooks: createHooks({ bootstrap, tenantChanges: process.env.HOOKS_MODIFY_TENANT === 'true', log: (m, d) => console.log('[hooks]', m, JSON.stringify(d || {})) }),
-    };
-  }
-  const config = { ...multiConfig, origin, allowLocal: local, sessionSecret: process.env.SESSION_SECRET, trustProxy: tp ? (/^\d+$/.test(tp) ? Number(tp) : tp) : undefined, orgUrl: OKTA_ORG_URL, gatewayUrl: GATEWAY_URL, clientId: CLIENT_ID, clientSecret: CLIENT_SECRET, logToken: multi ? undefined : process.env.OKTA_API_TOKEN, port: PORT };
-  createApp(config).listen(PORT, () => console.log(`Agent Gateway demo listening on port ${PORT}, public address ${origin || `http://localhost:${PORT}`}`));
+  try {
+    const config = configFromEnv(process.env, { redisFactory: (o) => new Redis(o) });
+    const origin = config.origin;
+    createApp(config).listen(config.port, () => console.log(`Agent Gateway demo listening on port ${config.port}, public address ${origin || `http://localhost:${config.port}`}`));
+  } catch (e) { console.error(e.message); process.exit(1); }
 }

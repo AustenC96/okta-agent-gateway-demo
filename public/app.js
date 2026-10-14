@@ -17,8 +17,23 @@ const carried = JSON.parse(sessionStorage.getItem('carriedTrace') || 'null');
 sessionStorage.removeItem('carriedTrace');
 const seen = [];
 let lastId = 0;
-const es = new EventSource(carried ? `/api/events?after=${carried.lastId}` : '/api/events');
-es.onmessage = (m) => renderEvent(JSON.parse(m.data), false);
+// The server says how to follow the trace: a live stream, or short polls on hosts that cannot hold a stream open.
+// Either way an event is shown once: ids only ever go up, so anything at or below the last one shown is skipped.
+function showLive(ev) { if ((ev.id || 0) > lastId) renderEvent(ev, false); }
+(async () => {
+  const mode = (await api('/api/transport')).mode;
+  if (mode === 'poll') {
+    let after = carried ? carried.lastId : (await api('/api/events/poll?init=1')).head || 0;
+    const tick = async () => {
+      try { const r = await api(`/api/events/poll?after=${after}`); for (const ev of r.events || []) showLive(ev); after = Math.max(after, r.head || 0); } catch { /* try again next tick */ }
+      setTimeout(tick, document.hidden ? 4000 : 1000);
+    };
+    tick();
+  } else {
+    const es = new EventSource(carried ? `/api/events?after=${carried.lastId}` : '/api/events');
+    es.onmessage = (m) => showLive(JSON.parse(m.data));
+  }
+})();
 document.addEventListener('click', (e) => {
   if (e.target.closest('a[href="/auth/login"]')) sessionStorage.setItem('carriedTrace', JSON.stringify({ events: seen, lastId }));
 });

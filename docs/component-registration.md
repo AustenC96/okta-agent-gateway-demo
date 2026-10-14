@@ -68,6 +68,8 @@ No per-demo settings are needed yet. The gateway URL currently has to be supplie
 8. **Domains.** The guide says `oktademo.app`; the quickstart landing page says `oktademo.engineering` (dev).
 
 ## Known limits of the current code
-- State (sessions, trace, discovery cache, Bootstrap cache) is in memory: single instance only, restart signs everyone out.
-- The live trace uses a long-lived stream (SSE), which does not suit serverless hosting.
+- With Redis configured, sessions, the trace and System Log evidence are shared across instances. The discovery cache and
+  the Bootstrap cache are still per instance (they are only caches and refill on demand).
+- Serverless hosting uses polling for the trace (about one request a second while the page is visible).
 - Two browser tabs in one browser share one session and trace.
+- Not yet deployed anywhere: the Vercel setup has only been exercised locally against stand-ins.

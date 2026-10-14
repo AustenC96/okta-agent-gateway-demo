@@ -65,14 +65,22 @@ verified against the real platform**; several details are still being confirmed 
 | `RESOLUTION_STRATEGY` | `query` (default, `?demoName=`) or `subdomain` (`<demo>.<BASE_URI host>`, needs a wildcard domain). |
 | `SESSION_SECRET` | Signs session cookies. Set it in any deployment with more than one instance. |
 | `TRUST_PROXY` | Number of reverse-proxy hops to trust (for example `1`), so secure cookies work behind a TLS-terminating proxy. |
+| `EVENT_TRANSPORT` | `poll` makes the browser fetch the trace with short polls instead of a live stream. Chosen automatically on Vercel. |
+| `UPSTASH_REDIS_REST_URL`, `UPSTASH_REDIS_REST_TOKEN` | A shared Redis (the `KV_REST_API_*` names set by the Vercel marketplace also work). Holds sessions, traces and System Log evidence so several instances can serve one user. Without it, state stays in memory. |
 | `CACHE_DURATION` | Minutes to cache a demo's Bootstrap record (default 60). |
 | `HOOKS_MODIFY_TENANT` | `true` lets the create/update/delete webhooks change a demo's Okta org. Off by default. |
 
 In this mode each demo's settings come from Bootstrap. Lifecycle webhooks are served at `/hooks/<event>`
 (`request`, `create`, `update`, `delete` or `destroy`, `execute`).
 
-**Not production-ready:** sessions and traces are held in memory, so a restart signs everyone out and the app must run as a
-single instance until a shared store is added.
+### Hosting on Vercel (prepared, not yet deployed)
+`api/index.js` and `vercel.json` run the whole app as one Vercel function. Requests are stateless there, so a shared Redis
+is required and the app refuses to start on Vercel without `UPSTASH_REDIS_REST_URL`/`_TOKEN` and `SESSION_SECRET`. Set these
+in the project's environment variables, never in the repository: `SESSION_SECRET`, the Redis pair, `BASE_URI`, and the
+`DEMO_API_*` credentials. The live trace switches to polling automatically. Nothing has been deployed yet, so treat this as
+untested against Vercel itself.
+
+Without Redis the app keeps everything in memory, so a restart signs everyone out and only one instance can run.
 
 ## Notes and limits
 - The gateway and Virtual MCP APIs are Research Release (Beta) and may change.
