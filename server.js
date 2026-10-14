@@ -265,8 +265,9 @@ export function createApp(config) {
     const verifier = crypto.randomBytes(48).toString('base64url');
     const challenge = crypto.createHash('sha256').update(verifier).digest('base64url');
     const state = crypto.randomBytes(16).toString('hex');
-    req.session.pkce = { verifier, state };
-    F(req).pkce = { verifier, challenge, method: 'S256', state, resource: req.tenant.gatewayUrl };
+    // Okta requires the same redirect_uri at /authorize and /token, so remember exactly what we sent.
+    req.session.pkce = { verifier, state, redirectUri: req.tenant.redirectUri };
+    F(req).pkce = { verifier, challenge, method: 'S256', state, resource: req.tenant.gatewayUrl, redirectUri: req.tenant.redirectUri };
     const scope = (prMeta?.scopes_supported || ['openid']).join(' ');
     const u = new URL(asMeta.authorization_endpoint);
     Object.entries({ client_id: req.tenant.clientId, response_type: 'code', redirect_uri: req.tenant.redirectUri, scope, state, code_challenge: challenge, code_challenge_method: 'S256', resource: req.tenant.gatewayUrl })
@@ -302,7 +303,7 @@ export function createApp(config) {
     });
     const { res: r, parsed } = await traced({
       sid: req.sessionID, step: 'login', node: 'access', label: 'Trade the authorization code for an access token', method: 'POST', url: asMeta.token_endpoint,
-      form: { grant_type: 'authorization_code', code, redirect_uri: req.tenant.redirectUri, client_id: req.tenant.clientId, client_secret: req.tenant.clientSecret, code_verifier: saved.verifier },
+      form: { grant_type: 'authorization_code', code, redirect_uri: saved.redirectUri, client_id: req.tenant.clientId, client_secret: req.tenant.clientSecret, code_verifier: saved.verifier },
       narrate: ({ ev, parsed }) => {
         if (ev.error) return `Token endpoint unreachable: ${ev.error}.`;
         if (ev.response.status !== 200) return `Okta rejected the code exchange (${parsed?.error || ev.response.status}${parsed?.error_description ? ': ' + parsed.error_description : ''}).`;
@@ -465,7 +466,7 @@ export function createApp(config) {
         authorization_endpoint: asMeta.authorization_endpoint, token_endpoint: asMeta.token_endpoint,
         code_challenge_methods_supported: asMeta.code_challenge_methods_supported } : null },
       pkce: { status: pk ? 'done' : 'idle', data: pk ? { code_verifier: fl.code ? pk.verifier : mask(pk.verifier), verifier_note: fl.code ? 'Redeemed, so it is now worthless. It is shown in full because the proof is spent.' : 'Secret: only the hash below ever leaves the app.', code_challenge: pk.challenge, code_challenge_method: pk.method, state: pk.state, resource: pk.resource } : null },
-      code: { status: fl.code ? 'done' : 'idle', data: fl.code ? { authorization_code: fl.code, single_use: true, redirect_uri: req.tenant.redirectUri } : null },
+      code: { status: fl.code ? 'done' : 'idle', data: fl.code ? { authorization_code: fl.code, single_use: true, redirect_uri: pk?.redirectUri || req.tenant.redirectUri } : null },
       access: { status: t ? 'done' : fl.tokenError ? 'error' : 'idle', data: t ? { access_token: t.access_token, token_type: t.token_type, scope: t.scope, expires_in: t.expires_in, refresh_token: t.refresh_token ? mask(t.refresh_token) : 'none issued', header: dec?.header, claims: dec?.claims, expiresAt: t.obtained_at + (t.expires_in || 0) * 1000 } : fl.tokenError || null },
       idtoken: { status: idDec ? 'done' : t ? 'skipped' : 'idle', data: idDec ? { id_token: t.id_token, header: idDec.header, claims: idDec.claims } : null },
       gateway: { status: !g.length ? 'idle' : gOk ? 'done' : 'error', data: g.length ? { calls: g.slice(-8), audience_matches_gateway: dec?.claims?.aud === req.tenant.gatewayUrl, token_audience: dec?.claims?.aud, gateway: req.tenant.gatewayUrl } : null },
@@ -487,6 +488,16 @@ if (process.argv[1] && import.meta.url === pathToFileURL(process.argv[1]).href) 
     if (!v) { console.error(`Missing ${k}. Copy .env.example to .env and fill it in (see README.md)`); process.exit(1); }
   }
   // Okta System Log evidence needs an admin token from the shell (or a local, gitignored .env); without it the STS stage has no log evidence.
-  const config = { orgUrl: OKTA_ORG_URL, gatewayUrl: GATEWAY_URL, clientId: CLIENT_ID, clientSecret: CLIENT_SECRET, logToken: process.env.OKTA_API_TOKEN, port: PORT };
-  createApp(config).listen(PORT, () => console.log(`Agent Gateway demo running at http://localhost:${PORT}`));
+  // The public address of this app. It is never taken from request headers, because Okta needs the exact value
+  // registered on the OIDC app and a spoofed Host header must not be able to change it.
+  let origin = process.env.BASE_URI ? process.env.BASE_URI.replace(/\/+$/, '') : undefined;
+  if (origin) {
+    let u; try { u = new URL(origin); } catch { /* handled below */ }
+    if (!u || !['http:', 'https:'].includes(u.protocol) || u.pathname !== '/' || u.search || u.hash || (u.protocol === 'http:' && !['localhost', '127.0.0.1'].includes(u.hostname))) {
+      console.error('BASE_URI must be an https origin such as https://demo.example.com (http is allowed only for localhost)'); process.exit(1);
+    }
+    origin = u.origin;
+  }
+  const config = { origin, orgUrl: OKTA_ORG_URL, gatewayUrl: GATEWAY_URL, clientId: CLIENT_ID, clientSecret: CLIENT_SECRET, logToken: process.env.OKTA_API_TOKEN, port: PORT };
+  createApp(config).listen(PORT, () => console.log(`Agent Gateway demo listening on port ${PORT}, public address ${origin || `http://localhost:${PORT}`}`));
 }
