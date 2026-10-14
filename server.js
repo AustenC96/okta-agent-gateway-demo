@@ -5,6 +5,8 @@ import crypto from 'node:crypto';
 import path from 'node:path';
 import { fileURLToPath, pathToFileURL } from 'node:url';
 import { tenantNameFrom } from './tenant.js';
+import { createBootstrap, toTenant } from './bootstrap.js';
+import { createHooks } from './hooks.js';
 
 const __dirname = path.dirname(fileURLToPath(import.meta.url));
 
@@ -190,6 +192,8 @@ export function createApp(config) {
   // ---------- app ----------
   const app = express();
   if (config.trustProxy) app.set('trust proxy', config.trustProxy);
+  // Platform webhooks carry no cookie and name their own demo, so they sit before the session and tenant middleware.
+  if (config.hooks) app.use('/hooks', config.hooks);
   app.use(express.json());
   // Scripts and styles do not need a session, so serve them before it; the page itself is served after the tenant check below.
   app.use(express.static(path.join(__dirname, 'public'), { index: false }));
@@ -548,11 +552,14 @@ export function createApp(config) {
 // Run as a server only when executed directly (npm start), not when imported by tests.
 if (process.argv[1] && import.meta.url === pathToFileURL(process.argv[1]).href) {
   dotenv.config();
-  const { OKTA_ORG_URL, GATEWAY_URL, CLIENT_ID, CLIENT_SECRET, PORT = 8080 } = process.env;
-  for (const [k, v] of Object.entries({ OKTA_ORG_URL, GATEWAY_URL, CLIENT_ID, CLIENT_SECRET })) {
+  const { OKTA_ORG_URL, GATEWAY_URL, CLIENT_ID, CLIENT_SECRET, PORT = 8080, DEMO_API_APP_ID, DEMO_API_CLIENT_ID, DEMO_API_CLIENT_SECRET } = process.env;
+  // Multi-tenant mode (hosted on the demo platform) is on when the Bootstrap credentials are present; otherwise the one
+  // org in the environment is served, exactly as before.
+  const multi = !!DEMO_API_APP_ID;
+  const need = multi ? { DEMO_API_APP_ID, DEMO_API_CLIENT_ID, DEMO_API_CLIENT_SECRET, BASE_URI: process.env.BASE_URI } : { OKTA_ORG_URL, GATEWAY_URL, CLIENT_ID, CLIENT_SECRET };
+  for (const [k, v] of Object.entries(need)) {
     if (!v) { console.error(`Missing ${k}. Copy .env.example to .env and fill it in (see README.md)`); process.exit(1); }
   }
-  // Okta System Log evidence needs an admin token from the shell (or a local, gitignored .env); without it the STS stage has no log evidence.
   // The public address of this app. It is never taken from request headers, because Okta needs the exact value
   // registered on the OIDC app and a spoofed Host header must not be able to change it.
   let origin = process.env.BASE_URI ? process.env.BASE_URI.replace(/\/+$/, '') : undefined;
@@ -565,6 +572,18 @@ if (process.argv[1] && import.meta.url === pathToFileURL(process.argv[1]).href) 
   }
   const local = !origin || ['localhost', '127.0.0.1'].includes(new URL(origin).hostname);
   const tp = process.env.TRUST_PROXY;
-  const config = { origin, allowLocal: local, sessionSecret: process.env.SESSION_SECRET, trustProxy: tp ? (/^\d+$/.test(tp) ? Number(tp) : tp) : undefined, orgUrl: OKTA_ORG_URL, gatewayUrl: GATEWAY_URL, clientId: CLIENT_ID, clientSecret: CLIENT_SECRET, logToken: process.env.OKTA_API_TOKEN, port: PORT };
+  let multiConfig = {};
+  if (multi) {
+    const bootstrap = createBootstrap({ appId: DEMO_API_APP_ID, clientId: DEMO_API_CLIENT_ID, clientSecret: DEMO_API_CLIENT_SECRET, cacheMinutes: Number(process.env.CACHE_DURATION) || 60 });
+    const strategy = process.env.RESOLUTION_STRATEGY || 'query';
+    if (!['query', 'subdomain'].includes(strategy)) { console.error('RESOLUTION_STRATEGY must be query or subdomain'); process.exit(1); }
+    multiConfig = {
+      resolution: { strategy, baseHost: new URL(origin).hostname },
+      getTenant: async (name) => (name === 'default' ? null : toTenant(await bootstrap.get(name))),
+      // Changes inside a demo's Okta org stay off until Demo Engineering confirms which client and scopes we may use.
+      hooks: createHooks({ bootstrap, tenantChanges: process.env.HOOKS_MODIFY_TENANT === 'true', log: (m, d) => console.log('[hooks]', m, JSON.stringify(d || {})) }),
+    };
+  }
+  const config = { ...multiConfig, origin, allowLocal: local, sessionSecret: process.env.SESSION_SECRET, trustProxy: tp ? (/^\d+$/.test(tp) ? Number(tp) : tp) : undefined, orgUrl: OKTA_ORG_URL, gatewayUrl: GATEWAY_URL, clientId: CLIENT_ID, clientSecret: CLIENT_SECRET, logToken: multi ? undefined : process.env.OKTA_API_TOKEN, port: PORT };
   createApp(config).listen(PORT, () => console.log(`Agent Gateway demo listening on port ${PORT}, public address ${origin || `http://localhost:${PORT}`}`));
 }
