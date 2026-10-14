@@ -80,20 +80,30 @@ export function createApp(config) {
   const GATEWAY_PATH = new URL(GATEWAY_URL).pathname;
 
   // ---------- event log (every real HTTP call lands here) ----------
-  const events = [];
-  const listeners = new Set();
-  let seq = 0;
-  function emit(ev) {
-    ev.id = ++seq;
+  // One bucket per browser session, so a visitor only ever sees their own calls.
+  const buckets = new Map();
+  const bucket = (sid) => {
+    let b = buckets.get(sid);
+    if (!b) buckets.set(sid, b = { events: [], listeners: new Set(), seq: 0, lastSeen: Date.now() });
+    b.lastSeen = Date.now();
+    return b;
+  };
+  function emit(sid, ev) {
+    const b = bucket(sid);
+    ev.id = ++b.seq;
     ev.ts = new Date().toISOString();
-    events.push(ev);
-    if (events.length > 500) events.shift();
-    for (const res of listeners) res.write(`data: ${JSON.stringify(ev)}\n\n`);
+    b.events.push(ev);
+    if (b.events.length > 500) b.events.shift();
+    for (const res of b.listeners) res.write(`data: ${JSON.stringify(ev)}\n\n`);
     return ev;
   }
+  // Drop buckets nobody has touched for an hour and that have no open stream.
+  setInterval(() => {
+    for (const [sid, b] of buckets) if (!b.listeners.size && Date.now() - b.lastSeen > 3600e3) buckets.delete(sid);
+  }, 600e3).unref();
 
   // A traced fetch: performs the real request and emits a structured event.
-  async function traced({ step, node, label, method = 'GET', url, headers = {}, body, form, narrate }) {
+  async function traced({ sid, step, node, label, method = 'GET', url, headers = {}, body, form, narrate }) {
     const started = Date.now();
     const reqHeaders = { ...headers };
     let payload;
@@ -124,7 +134,7 @@ export function createApp(config) {
     };
     ev.narration = narrate ? narrate({ ev, res, parsed, resHeaders }) : defaultNarration(ev);
     ev.outcome = error ? 'error' : res.status < 300 ? 'ok' : res.status === 401 || res.status === 403 || res.status === 400 ? 'denied' : 'error';
-    emit(ev);
+    emit(sid, ev);
     return { res, parsed, resHeaders, ev };
   }
 
@@ -165,10 +175,11 @@ export function createApp(config) {
     // A fresh page load starts empty. The only exception is returning from the Okta redirect:
     // the client passes ?after=<last id it showed> so it receives just the calls it missed.
     const after = Number(req.query.after);
-    if (Number.isFinite(after)) for (const ev of events) if (ev.id > after) res.write(`data: ${JSON.stringify(ev)}\n\n`);
-    listeners.add(res);
+    const b = bucket(req.sessionID);
+    if (Number.isFinite(after)) for (const ev of b.events) if (ev.id > after) res.write(`data: ${JSON.stringify(ev)}\n\n`);
+    b.listeners.add(res);
     const ping = setInterval(() => res.write(': ping\n\n'), 15000);
-    req.on('close', () => { clearInterval(ping); listeners.delete(res); });
+    req.on('close', () => { clearInterval(ping); b.listeners.delete(res); });
   });
   // Called on every page load. Coming back from Okta keeps the walkthrough where it was (the callback set
   // returnedFromOkta); any other load, such as a manual refresh, restarts it at step 1.
@@ -178,13 +189,13 @@ export function createApp(config) {
     if (!returned) { req.session.discovered = false; req.session.flow = null; stsEvidence.delete(req.sessionID); }
     res.json({ returned });
   });
-  app.post('/api/events/clear', (_req, res) => { events.length = 0; res.json({ ok: true }); });
+  app.post('/api/events/clear', (req, res) => { bucket(req.sessionID).events.length = 0; res.json({ ok: true }); });
 
   // Step 1: discovery. First poke the gateway with no credentials, then follow what it tells us.
   app.post('/api/discover', async (req, res) => {
     const init = { jsonrpc: '2.0', id: 1, method: 'initialize', params: { protocolVersion: '2025-06-18', capabilities: {}, clientInfo: { name: 'agent-gateway-demo', version: '1.0.0' } } };
     const probe = await traced({
-      step: 'discover', node: 'discover', label: 'Knock on the gateway with no credentials', method: 'POST', url: GATEWAY_URL,
+      sid: req.sessionID, step: 'discover', node: 'discover', label: 'Knock on the gateway with no credentials', method: 'POST', url: GATEWAY_URL,
       headers: { Accept: 'application/json, text/event-stream' }, body: init,
       narrate: ({ ev, resHeaders }) => {
         if (ev.error) return `Could not reach the gateway: ${ev.error}.`;
@@ -199,7 +210,7 @@ export function createApp(config) {
     const m = /resource_metadata="([^"]+)"/.exec(wa);
     const prUrl = m?.[1] || `${GATEWAY_ORIGIN}/.well-known/oauth-protected-resource${GATEWAY_PATH}`;
     const pr = await traced({
-      step: 'discover', node: 'discover', label: 'Read the gateway’s protected-resource metadata', url: prUrl,
+      sid: req.sessionID, step: 'discover', node: 'discover', label: 'Read the gateway’s protected-resource metadata', url: prUrl,
       narrate: ({ ev, parsed }) => ev.error ? `Metadata fetch failed: ${ev.error}.` : ev.response.status !== 200 ? `Metadata endpoint returned ${ev.response.status}.`
         : `The gateway says it is the protected resource “${new URL(parsed.resource).pathname}” and that tokens must come from ${parsed.authorization_servers?.[0]}. Supported scopes: ${(parsed.scopes_supported || []).join(', ')}. The client now knows exactly who to ask for a token.`,
     });
@@ -207,7 +218,7 @@ export function createApp(config) {
     const asBase = prMeta?.authorization_servers?.[0];
     if (!asBase) return res.status(502).json({ error: 'No authorization server advertised by gateway' });
     const as = await traced({
-      step: 'discover', node: 'discover', label: 'Read the authorization server’s metadata', url: `${asBase}/.well-known/oauth-authorization-server`,
+      sid: req.sessionID, step: 'discover', node: 'discover', label: 'Read the authorization server’s metadata', url: `${asBase}/.well-known/oauth-authorization-server`,
       narrate: ({ ev, parsed }) => ev.error ? `Failed: ${ev.error}.` : ev.response.status !== 200 ? `Returned ${ev.response.status}.`
         : `This is a dedicated Okta custom authorization server created for the gateway. It supports ${(parsed.grant_types_supported || []).length} grant types and PKCE methods ${(parsed.code_challenge_methods_supported || []).join(', ')}. We will use the authorization endpoint ${new URL(parsed.authorization_endpoint).pathname} and token endpoint ${new URL(parsed.token_endpoint).pathname}.`,
     });
@@ -228,7 +239,7 @@ export function createApp(config) {
     const u = new URL(asMeta.authorization_endpoint);
     Object.entries({ client_id: CLIENT_ID, response_type: 'code', redirect_uri: REDIRECT_URI, scope, state, code_challenge: challenge, code_challenge_method: 'S256', resource: GATEWAY_URL })
       .forEach(([k, v]) => u.searchParams.set(k, v));
-    emit({
+    emit(req.sessionID, {
       step: 'login', node: 'pkce', label: 'Send the user to Okta to sign in', method: 'GET (browser redirect)', url: u.toString().replace(/code_challenge=[^&]+/, 'code_challenge=' + mask(challenge)),
       request: { headers: {}, body: { response_type: 'code', scope, code_challenge_method: 'S256', code_challenge: mask(challenge), state: mask(state), resource: GATEWAY_URL } },
       response: null, ms: 0, outcome: 'ok',
@@ -243,21 +254,21 @@ export function createApp(config) {
     req.session.discovered = true;
     const saved = req.session.pkce;
     if (error) {
-      emit({ step: 'login', label: 'Okta returned an error', method: 'GET', url: req.originalUrl, request: { headers: {} }, response: { status: 400, body: { error, error_description } }, ms: 0, outcome: 'denied', narration: `Okta refused the sign-in: ${error}${error_description ? ` — ${error_description}` : ''}. Nothing was issued.` });
+      emit(req.sessionID, { step: 'login', label: 'Okta returned an error', method: 'GET', url: req.originalUrl, request: { headers: {} }, response: { status: 400, body: { error, error_description } }, ms: 0, outcome: 'denied', narration: `Okta refused the sign-in: ${error}${error_description ? ` — ${error_description}` : ''}. Nothing was issued.` });
       return res.redirect('/');
     }
     if (!saved || state !== saved.state) {
-      emit({ step: 'login', label: 'State mismatch', method: 'GET', url: req.originalUrl, request: { headers: {} }, response: { status: 400 }, ms: 0, outcome: 'denied', narration: 'The state value that came back did not match the one we sent. This is the CSRF check, so the response was discarded.' });
+      emit(req.sessionID, { step: 'login', label: 'State mismatch', method: 'GET', url: req.originalUrl, request: { headers: {} }, response: { status: 400 }, ms: 0, outcome: 'denied', narration: 'The state value that came back did not match the one we sent. This is the CSRF check, so the response was discarded.' });
       return res.redirect('/');
     }
     F(req).code = code;
-    emit({
+    emit(req.sessionID, {
       step: 'login', node: 'code', label: 'Okta sent the user back with an authorization code', method: 'GET (browser redirect)', url: `${ORIGIN}/authorization-code/callback`,
       request: { headers: {}, body: { code: mask(code), state: mask(state) } }, response: null, ms: 0, outcome: 'ok',
       narration: 'The user signed in and Okta redirected the browser back with a one-time authorization code. The code is useless on its own: it can only be redeemed together with the PKCE secret that only this app holds, and only once.',
     });
     const { res: r, parsed } = await traced({
-      step: 'login', node: 'access', label: 'Trade the authorization code for an access token', method: 'POST', url: asMeta.token_endpoint,
+      sid: req.sessionID, step: 'login', node: 'access', label: 'Trade the authorization code for an access token', method: 'POST', url: asMeta.token_endpoint,
       form: { grant_type: 'authorization_code', code, redirect_uri: REDIRECT_URI, client_id: CLIENT_ID, client_secret: CLIENT_SECRET, code_verifier: saved.verifier },
       narrate: ({ ev, parsed }) => {
         if (ev.error) return `Token endpoint unreachable: ${ev.error}.`;
@@ -277,7 +288,7 @@ export function createApp(config) {
   app.post('/api/logout', (req, res) => {
     Object.assign(req.session, { tokens: null, mcpSessionId: null, pkce: null, discovered: false, returnedFromOkta: false, flow: null });
     stsEvidence.delete(req.sessionID);
-    events.length = 0; seq = 0;
+    const b = bucket(req.sessionID); b.events.length = 0; b.seq = 0;
     res.json({ ok: true });
   });
 
@@ -290,7 +301,7 @@ export function createApp(config) {
     if (req.session.mcpSessionId) headers['Mcp-Session-Id'] = req.session.mcpSessionId;
     const body = method.startsWith('notifications/') ? { jsonrpc: '2.0', method, params } : { jsonrpc: '2.0', id: ++rpcId, method, params };
     const startedAt = Date.now();
-    const r = await traced({ step: 'mcp', node, label, method: 'POST', url: GATEWAY_URL, headers, body, narrate });
+    const r = await traced({ sid: req.sessionID, step: 'mcp', node, label, method: 'POST', url: GATEWAY_URL, headers, body, narrate });
     const sid = r.resHeaders['mcp-session-id'];
     if (sid) req.session.mcpSessionId = sid;
     if (!method.startsWith('notifications/')) {
@@ -394,14 +405,14 @@ export function createApp(config) {
       } else {
         narration = `The call succeeded, so the gateway must have used a GitHub token, but Okta’s log shows no token exchange for this agent in the last 24 hours. The log can lag; this stays “inferred” until a record appears.`;
       }
-      emit({
+      emit(sid, {
         step: 'mcp', node: 'sts', label: 'Okta System Log: the token exchange behind that call', method: 'GET', url: `${OKTA_ORG_URL}/api/v1/logs`,
         request: { headers: redactHeaders(hdr), body: { since: new Date(sinceMs - 5000).toISOString(), filter: 'token exchange + agent_gateway events' } },
         response: { status: 200, body: { exchange, mostRecentExchange: latest, gatewayEvents: gw, githubConsentOnFile: consent } },
         ms: Date.now() - started, outcome: exchange && exchange.result !== 'SUCCESS' ? 'error' : 'ok', narration,
       });
     } catch (e) {
-      emit({ step: 'mcp', node: 'sts', label: 'Okta System Log lookup failed', method: 'GET', url: `${OKTA_ORG_URL}/api/v1/logs`, request: { headers: redactHeaders(hdr) }, response: null, ms: Date.now() - started, error: String(e.message || e), outcome: 'error', narration: `Could not read Okta’s System Log: ${e.message}. The exchange still happened; only the evidence is missing.` });
+      emit(sid, { step: 'mcp', node: 'sts', label: 'Okta System Log lookup failed', method: 'GET', url: `${OKTA_ORG_URL}/api/v1/logs`, request: { headers: redactHeaders(hdr) }, response: null, ms: Date.now() - started, error: String(e.message || e), outcome: 'error', narration: `Could not read Okta’s System Log: ${e.message}. The exchange still happened; only the evidence is missing.` });
     }
   }
 
