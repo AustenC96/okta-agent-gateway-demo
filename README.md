@@ -13,7 +13,7 @@ the AI agent and the GitHub connection; this app is a front end that plays the a
 1. A demo org with the Agent Gateway component attached and working. Complete **Parts 1-4** of the
    *Demo Guide: Okta Agent Gateway* (GitHub App, API token, attach, GitHub consent, discover tools).
    You do not need Claude Code (Part 5) for this app.
-2. Node.js 18+.
+2. Node.js 20 or newer.
 
 ## Setup
 
@@ -43,6 +43,36 @@ npm start
 ```
 Open http://localhost:8080 and follow the steps. Sign in as a user assigned to the agent app (the demo owner is
 assigned automatically).
+
+## Tests
+```sh
+npm test
+```
+Runs without any Okta org or network access: it starts the app on a random port against local stub servers. It covers
+trace isolation between visitors, per-demo discovery, redirect URI handling, the System Log user filter, URL safety checks,
+the Bootstrap client and the webhook handlers.
+
+## Hosted, multi-tenant mode (work in progress)
+
+The app can also run as a shared service for the demo platform, serving many demos from one deployment. This is **not yet
+verified against the real platform**; several details are still being confirmed with Demo Engineering (see
+`docs/component-registration.md`). It switches on when the Bootstrap credentials are set:
+
+| Variable | Purpose |
+| --- | --- |
+| `DEMO_API_APP_ID`, `DEMO_API_CLIENT_ID`, `DEMO_API_CLIENT_SECRET` | The component's Bootstrap credentials from the platform. Turns multi-tenant mode on. |
+| `BASE_URI` | The public https address of this deployment. Required in multi-tenant mode. Used as the OAuth redirect URI base; never taken from request headers. |
+| `RESOLUTION_STRATEGY` | `query` (default, `?demoName=`) or `subdomain` (`<demo>.<BASE_URI host>`, needs a wildcard domain). |
+| `SESSION_SECRET` | Signs session cookies. Set it in any deployment with more than one instance. |
+| `TRUST_PROXY` | Number of reverse-proxy hops to trust (for example `1`), so secure cookies work behind a TLS-terminating proxy. |
+| `CACHE_DURATION` | Minutes to cache a demo's Bootstrap record (default 60). |
+| `HOOKS_MODIFY_TENANT` | `true` lets the create/update/delete webhooks change a demo's Okta org. Off by default. |
+
+In this mode each demo's settings come from Bootstrap. Lifecycle webhooks are served at `/hooks/<event>`
+(`request`, `create`, `update`, `delete` or `destroy`, `execute`).
+
+**Not production-ready:** sessions and traces are held in memory, so a restart signs everyone out and the app must run as a
+single instance until a shared store is added.
 
 ## Notes and limits
 - The gateway and Virtual MCP APIs are Research Release (Beta) and may change.
