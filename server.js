@@ -4,6 +4,7 @@ import session from 'express-session';
 import crypto from 'node:crypto';
 import path from 'node:path';
 import { fileURLToPath, pathToFileURL } from 'node:url';
+import { tenantNameFrom } from './tenant.js';
 
 const __dirname = path.dirname(fileURLToPath(import.meta.url));
 
@@ -73,11 +74,17 @@ export function stsStatus({ sts, consentUrl, callOk }) {
 // Builds one self-contained app. All mutable state (trace, discovery results, STS evidence) lives inside this closure,
 // so each call gets its own state and nothing leaks between instances.
 export function createApp(config) {
-  const { orgUrl: OKTA_ORG_URL, gatewayUrl: GATEWAY_URL, clientId: CLIENT_ID, clientSecret: CLIENT_SECRET, logToken: LOG_TOKEN } = config;
-  const ORIGIN = config.origin || `http://localhost:${config.port}`;
-  const REDIRECT_URI = `${ORIGIN}/authorization-code/callback`;
-  const GATEWAY_ORIGIN = new URL(GATEWAY_URL).origin;
-  const GATEWAY_PATH = new URL(GATEWAY_URL).pathname;
+  const resolution = config.resolution || { strategy: 'none' };
+  // A tenant is one demo's settings. With no getTenant, the one configured tenant is served as 'default'.
+  const staticTenant = config.gatewayUrl && { name: 'default', orgUrl: config.orgUrl, gatewayUrl: config.gatewayUrl, clientId: config.clientId, clientSecret: config.clientSecret, logToken: config.logToken, origin: config.origin };
+  const rawTenant = config.getTenant || (async (name) => (name === 'default' ? staticTenant : null));
+  const getTenant = async (name) => {
+    const t = await rawTenant(name);
+    if (!t) return null;
+    const origin = t.origin || config.origin || `http://localhost:${config.port}`;
+    const gw = new URL(t.gatewayUrl);
+    return { ...t, name, origin, redirectUri: `${origin}/authorization-code/callback`, gatewayOrigin: gw.origin, gatewayPath: gw.pathname };
+  };
 
   // ---------- event log (every real HTTP call lands here) ----------
   // One bucket per browser session, so a visitor only ever sees their own calls.
@@ -142,21 +149,44 @@ export function createApp(config) {
   const app = express();
   app.use(express.json());
   app.use(session({ secret: crypto.randomBytes(32).toString('hex'), resave: false, saveUninitialized: true, cookie: { sameSite: 'lax' } }));
+  // Resolve which demo this request is for. The OAuth callback always uses the tenant the sign-in started under,
+  // never anything in its own query string, and switching demos drops the previous demo's tokens.
+  const resetAuth = (req) => {
+    Object.assign(req.session, { tokens: null, mcpSessionId: null, pkce: null, discovered: false, returnedFromOkta: false, flow: null });
+    stsEvidence.delete(req.sessionID);
+  };
+  app.use(async (req, res, next) => {
+    try {
+      let name;
+      if (req.path === '/authorization-code/callback' && req.session.tenant) name = req.session.tenant;
+      else {
+        const r = tenantNameFrom(req, resolution);
+        if (r.invalid) return res.status(400).json({ error: 'Invalid demo name' });
+        name = r.name || (resolution.strategy === 'query' && req.session.tenant) || 'default';
+      }
+      const tenant = await getTenant(name);
+      if (!tenant) return res.status(404).json({ error: 'Unknown demo' });
+      if (req.session.tenant && req.session.tenant !== name) resetAuth(req);
+      req.session.tenant = name;
+      req.tenant = tenant;
+      next();
+    } catch (e) { next(e); }
+  });
   app.use(express.static(path.join(__dirname, 'public')));
 
   // Okta System Log evidence arrives seconds after the HTTP response is sent, and express-session only saves at response time,
   // so anything written later would be lost. Keep it here, keyed by session id.
   const stsEvidence = new Map();
   const F = (req) => (req.session.flow ||= { gateway: { calls: [] }, toolCalls: [], sts: null, stsConsent: null });
-  const ISSUER = () => asMeta?.issuer;
-  let asMeta = null;
-  let prMeta = null;
+  // Public metadata the gateway published, cached per tenant so one demo's discovery never answers for another's.
+  const discovery = new Map();
+  const disc = (req) => { let d = discovery.get(req.tenant.name); if (!d) discovery.set(req.tenant.name, d = {}); return d; };
 
   app.get('/api/config', (req, res) => {
     const t = req.session.tokens;
     res.json({
-      gatewayUrl: GATEWAY_URL, orgUrl: OKTA_ORG_URL, clientId: CLIENT_ID, redirectUri: REDIRECT_URI,
-      discovered: !!req.session.discovered && !!asMeta, signedIn: !!t, tokenInfo: t ? tokenInfo(t) : null, mcpSessionId: req.session.mcpSessionId || null,
+      gatewayUrl: req.tenant.gatewayUrl, orgUrl: req.tenant.orgUrl, clientId: req.tenant.clientId, redirectUri: req.tenant.redirectUri,
+      discovered: !!req.session.discovered && !!disc(req).asMeta, signedIn: !!t, tokenInfo: t ? tokenInfo(t) : null, mcpSessionId: req.session.mcpSessionId || null,
     });
   });
   function tokenInfo(t) {
@@ -195,7 +225,7 @@ export function createApp(config) {
   app.post('/api/discover', async (req, res) => {
     const init = { jsonrpc: '2.0', id: 1, method: 'initialize', params: { protocolVersion: '2025-06-18', capabilities: {}, clientInfo: { name: 'agent-gateway-demo', version: '1.0.0' } } };
     const probe = await traced({
-      sid: req.sessionID, step: 'discover', node: 'discover', label: 'Knock on the gateway with no credentials', method: 'POST', url: GATEWAY_URL,
+      sid: req.sessionID, step: 'discover', node: 'discover', label: 'Knock on the gateway with no credentials', method: 'POST', url: req.tenant.gatewayUrl,
       headers: { Accept: 'application/json, text/event-stream' }, body: init,
       narrate: ({ ev, resHeaders }) => {
         if (ev.error) return `Could not reach the gateway: ${ev.error}.`;
@@ -208,40 +238,42 @@ export function createApp(config) {
     });
     const wa = probe.resHeaders['www-authenticate'] || '';
     const m = /resource_metadata="([^"]+)"/.exec(wa);
-    const prUrl = m?.[1] || `${GATEWAY_ORIGIN}/.well-known/oauth-protected-resource${GATEWAY_PATH}`;
+    const prUrl = m?.[1] || `${req.tenant.gatewayOrigin}/.well-known/oauth-protected-resource${req.tenant.gatewayPath}`;
     const pr = await traced({
       sid: req.sessionID, step: 'discover', node: 'discover', label: 'Read the gateway’s protected-resource metadata', url: prUrl,
       narrate: ({ ev, parsed }) => ev.error ? `Metadata fetch failed: ${ev.error}.` : ev.response.status !== 200 ? `Metadata endpoint returned ${ev.response.status}.`
         : `The gateway says it is the protected resource “${new URL(parsed.resource).pathname}” and that tokens must come from ${parsed.authorization_servers?.[0]}. Supported scopes: ${(parsed.scopes_supported || []).join(', ')}. The client now knows exactly who to ask for a token.`,
     });
-    prMeta = pr.parsed;
-    const asBase = prMeta?.authorization_servers?.[0];
+    const d = disc(req);
+    d.prMeta = pr.parsed;
+    const asBase = d.prMeta?.authorization_servers?.[0];
     if (!asBase) return res.status(502).json({ error: 'No authorization server advertised by gateway' });
     const as = await traced({
       sid: req.sessionID, step: 'discover', node: 'discover', label: 'Read the authorization server’s metadata', url: `${asBase}/.well-known/oauth-authorization-server`,
       narrate: ({ ev, parsed }) => ev.error ? `Failed: ${ev.error}.` : ev.response.status !== 200 ? `Returned ${ev.response.status}.`
         : `This is a dedicated Okta custom authorization server created for the gateway. It supports ${(parsed.grant_types_supported || []).length} grant types and PKCE methods ${(parsed.code_challenge_methods_supported || []).join(', ')}. We will use the authorization endpoint ${new URL(parsed.authorization_endpoint).pathname} and token endpoint ${new URL(parsed.token_endpoint).pathname}.`,
     });
-    asMeta = as.parsed;
-    req.session.discovered = !!asMeta?.authorization_endpoint;
-    res.json({ ok: !!asMeta?.authorization_endpoint });
+    d.asMeta = as.parsed;
+    req.session.discovered = !!d.asMeta?.authorization_endpoint;
+    res.json({ ok: !!d.asMeta?.authorization_endpoint });
   });
 
   // Step 2: authorization code + PKCE
   app.get('/auth/login', async (req, res) => {
+    const { asMeta, prMeta } = disc(req);
     if (!asMeta) return res.status(409).send('Run discovery first.');
     const verifier = crypto.randomBytes(48).toString('base64url');
     const challenge = crypto.createHash('sha256').update(verifier).digest('base64url');
     const state = crypto.randomBytes(16).toString('hex');
     req.session.pkce = { verifier, state };
-    F(req).pkce = { verifier, challenge, method: 'S256', state, resource: GATEWAY_URL };
+    F(req).pkce = { verifier, challenge, method: 'S256', state, resource: req.tenant.gatewayUrl };
     const scope = (prMeta?.scopes_supported || ['openid']).join(' ');
     const u = new URL(asMeta.authorization_endpoint);
-    Object.entries({ client_id: CLIENT_ID, response_type: 'code', redirect_uri: REDIRECT_URI, scope, state, code_challenge: challenge, code_challenge_method: 'S256', resource: GATEWAY_URL })
+    Object.entries({ client_id: req.tenant.clientId, response_type: 'code', redirect_uri: req.tenant.redirectUri, scope, state, code_challenge: challenge, code_challenge_method: 'S256', resource: req.tenant.gatewayUrl })
       .forEach(([k, v]) => u.searchParams.set(k, v));
     emit(req.sessionID, {
       step: 'login', node: 'pkce', label: 'Send the user to Okta to sign in', method: 'GET (browser redirect)', url: u.toString().replace(/code_challenge=[^&]+/, 'code_challenge=' + mask(challenge)),
-      request: { headers: {}, body: { response_type: 'code', scope, code_challenge_method: 'S256', code_challenge: mask(challenge), state: mask(state), resource: GATEWAY_URL } },
+      request: { headers: {}, body: { response_type: 'code', scope, code_challenge_method: 'S256', code_challenge: mask(challenge), state: mask(state), resource: req.tenant.gatewayUrl } },
       response: null, ms: 0, outcome: 'ok',
       narration: `The app generated a random PKCE secret and sent only its SHA-256 hash (the challenge) to Okta. Anyone who intercepts the redirect cannot redeem the code without the original secret. The resource parameter pins the resulting token to this specific gateway, and scopes are ${scope}.`,
     });
@@ -253,6 +285,7 @@ export function createApp(config) {
     req.session.returnedFromOkta = true; // success or failure, the page that loads next is the return from Okta
     req.session.discovered = true;
     const saved = req.session.pkce;
+    const { asMeta } = disc(req);
     if (error) {
       emit(req.sessionID, { step: 'login', label: 'Okta returned an error', method: 'GET', url: req.originalUrl, request: { headers: {} }, response: { status: 400, body: { error, error_description } }, ms: 0, outcome: 'denied', narration: `Okta refused the sign-in: ${error}${error_description ? ` — ${error_description}` : ''}. Nothing was issued.` });
       return res.redirect('/');
@@ -263,13 +296,13 @@ export function createApp(config) {
     }
     F(req).code = code;
     emit(req.sessionID, {
-      step: 'login', node: 'code', label: 'Okta sent the user back with an authorization code', method: 'GET (browser redirect)', url: `${ORIGIN}/authorization-code/callback`,
+      step: 'login', node: 'code', label: 'Okta sent the user back with an authorization code', method: 'GET (browser redirect)', url: `${req.tenant.origin}/authorization-code/callback`,
       request: { headers: {}, body: { code: mask(code), state: mask(state) } }, response: null, ms: 0, outcome: 'ok',
       narration: 'The user signed in and Okta redirected the browser back with a one-time authorization code. The code is useless on its own: it can only be redeemed together with the PKCE secret that only this app holds, and only once.',
     });
     const { res: r, parsed } = await traced({
       sid: req.sessionID, step: 'login', node: 'access', label: 'Trade the authorization code for an access token', method: 'POST', url: asMeta.token_endpoint,
-      form: { grant_type: 'authorization_code', code, redirect_uri: REDIRECT_URI, client_id: CLIENT_ID, client_secret: CLIENT_SECRET, code_verifier: saved.verifier },
+      form: { grant_type: 'authorization_code', code, redirect_uri: req.tenant.redirectUri, client_id: req.tenant.clientId, client_secret: req.tenant.clientSecret, code_verifier: saved.verifier },
       narrate: ({ ev, parsed }) => {
         if (ev.error) return `Token endpoint unreachable: ${ev.error}.`;
         if (ev.response.status !== 200) return `Okta rejected the code exchange (${parsed?.error || ev.response.status}${parsed?.error_description ? ': ' + parsed.error_description : ''}).`;
@@ -286,8 +319,7 @@ export function createApp(config) {
   });
 
   app.post('/api/logout', (req, res) => {
-    Object.assign(req.session, { tokens: null, mcpSessionId: null, pkce: null, discovered: false, returnedFromOkta: false, flow: null });
-    stsEvidence.delete(req.sessionID);
+    resetAuth(req);
     const b = bucket(req.sessionID); b.events.length = 0; b.seq = 0;
     res.json({ ok: true });
   });
@@ -301,7 +333,7 @@ export function createApp(config) {
     if (req.session.mcpSessionId) headers['Mcp-Session-Id'] = req.session.mcpSessionId;
     const body = method.startsWith('notifications/') ? { jsonrpc: '2.0', method, params } : { jsonrpc: '2.0', id: ++rpcId, method, params };
     const startedAt = Date.now();
-    const r = await traced({ sid: req.sessionID, step: 'mcp', node, label, method: 'POST', url: GATEWAY_URL, headers, body, narrate });
+    const r = await traced({ sid: req.sessionID, step: 'mcp', node, label, method: 'POST', url: req.tenant.gatewayUrl, headers, body, narrate });
     const sid = r.resHeaders['mcp-session-id'];
     if (sid) req.session.mcpSessionId = sid;
     if (!method.startsWith('notifications/')) {
@@ -371,10 +403,10 @@ export function createApp(config) {
   // (or an OKTA_API_TOKEN line in your local, gitignored .env); without it the STS stage simply has no log evidence.
 
   async function collectSts(req, sinceMs, tool) {
-    if (!LOG_TOKEN) return;
+    if (!req.tenant.logToken) return;
     const sid = req.sessionID;
-    const hdr = { Authorization: `SSWS ${LOG_TOKEN}`, Accept: 'application/json' };
-    const q = (extra) => `${OKTA_ORG_URL}/api/v1/logs?${new URLSearchParams({ limit: '100', ...extra })}`;
+    const hdr = { Authorization: `SSWS ${req.tenant.logToken}`, Accept: 'application/json' };
+    const q = (extra) => `${req.tenant.orgUrl}/api/v1/logs?${new URLSearchParams({ limit: '100', ...extra })}`;
     const get = async (url) => {
       const j = await fetch(url, { headers: hdr, signal: AbortSignal.timeout(20000) }).then((r) => r.json());
       if (!Array.isArray(j)) throw new Error(j?.errorSummary || 'unexpected System Log response');
@@ -391,7 +423,7 @@ export function createApp(config) {
       }
       const exchange = [...win].reverse().find((e) => e.eventType === STS_EVENT) || null;
       // No fresh exchange means the gateway may have reused a downstream token it already held; find the latest one for this agent.
-      const latest = exchange ? null : (await get(q({ since: new Date(Date.now() - 864e5).toISOString(), sortOrder: 'DESCENDING', limit: '20', filter: `eventType sw "${STS_EVENT}"` }))).find((e) => e.subjectTokenClientId === CLIENT_ID) || null;
+      const latest = exchange ? null : (await get(q({ since: new Date(Date.now() - 864e5).toISOString(), sortOrder: 'DESCENDING', limit: '20', filter: `eventType sw "${STS_EVENT}"` }))).find((e) => e.subjectTokenClientId === req.tenant.clientId) || null;
       const consent = (await get(q({ since: new Date(Date.now() - 7 * 864e5).toISOString(), sortOrder: 'DESCENDING', limit: '1', filter: 'eventType eq "app.oauth2.token.oauth_sts.request_token"' })))[0] || null;
       stsEvidence.set(sid, { exchange, latest, reused: !exchange && !!latest, consent, window: win, checkedAt: new Date().toISOString(), tool });
       const t = (iso) => new Date(iso).toLocaleTimeString();
@@ -406,13 +438,13 @@ export function createApp(config) {
         narration = `The call succeeded, so the gateway must have used a GitHub token, but Okta’s log shows no token exchange for this agent in the last 24 hours. The log can lag; this stays “inferred” until a record appears.`;
       }
       emit(sid, {
-        step: 'mcp', node: 'sts', label: 'Okta System Log: the token exchange behind that call', method: 'GET', url: `${OKTA_ORG_URL}/api/v1/logs`,
+        step: 'mcp', node: 'sts', label: 'Okta System Log: the token exchange behind that call', method: 'GET', url: `${req.tenant.orgUrl}/api/v1/logs`,
         request: { headers: redactHeaders(hdr), body: { since: new Date(sinceMs - 5000).toISOString(), filter: 'token exchange + agent_gateway events' } },
         response: { status: 200, body: { exchange, mostRecentExchange: latest, gatewayEvents: gw, githubConsentOnFile: consent } },
         ms: Date.now() - started, outcome: exchange && exchange.result !== 'SUCCESS' ? 'error' : 'ok', narration,
       });
     } catch (e) {
-      emit(sid, { step: 'mcp', node: 'sts', label: 'Okta System Log lookup failed', method: 'GET', url: `${OKTA_ORG_URL}/api/v1/logs`, request: { headers: redactHeaders(hdr) }, response: null, ms: Date.now() - started, error: String(e.message || e), outcome: 'error', narration: `Could not read Okta’s System Log: ${e.message}. The exchange still happened; only the evidence is missing.` });
+      emit(sid, { step: 'mcp', node: 'sts', label: 'Okta System Log lookup failed', method: 'GET', url: `${req.tenant.orgUrl}/api/v1/logs`, request: { headers: redactHeaders(hdr) }, response: null, ms: Date.now() - started, error: String(e.message || e), outcome: 'error', narration: `Could not read Okta’s System Log: ${e.message}. The exchange still happened; only the evidence is missing.` });
     }
   }
 
@@ -426,17 +458,18 @@ export function createApp(config) {
     const ghRec = ev?.exchange || ev?.latest || null;
     const dec = t ? decodeJwt(t.access_token) : null, idDec = t?.id_token ? decodeJwt(t.id_token) : null;
     const pk = fl.pkce;
+    const { asMeta, prMeta } = disc(req);
     const nodes = {
       discover: { status: s.discovered && asMeta ? 'done' : 'idle', data: asMeta ? {
         resource: prMeta?.resource, scopes_supported: prMeta?.scopes_supported, authorization_server: asMeta.issuer,
         authorization_endpoint: asMeta.authorization_endpoint, token_endpoint: asMeta.token_endpoint,
         code_challenge_methods_supported: asMeta.code_challenge_methods_supported } : null },
       pkce: { status: pk ? 'done' : 'idle', data: pk ? { code_verifier: fl.code ? pk.verifier : mask(pk.verifier), verifier_note: fl.code ? 'Redeemed, so it is now worthless. It is shown in full because the proof is spent.' : 'Secret: only the hash below ever leaves the app.', code_challenge: pk.challenge, code_challenge_method: pk.method, state: pk.state, resource: pk.resource } : null },
-      code: { status: fl.code ? 'done' : 'idle', data: fl.code ? { authorization_code: fl.code, single_use: true, redirect_uri: REDIRECT_URI } : null },
+      code: { status: fl.code ? 'done' : 'idle', data: fl.code ? { authorization_code: fl.code, single_use: true, redirect_uri: req.tenant.redirectUri } : null },
       access: { status: t ? 'done' : fl.tokenError ? 'error' : 'idle', data: t ? { access_token: t.access_token, token_type: t.token_type, scope: t.scope, expires_in: t.expires_in, refresh_token: t.refresh_token ? mask(t.refresh_token) : 'none issued', header: dec?.header, claims: dec?.claims, expiresAt: t.obtained_at + (t.expires_in || 0) * 1000 } : fl.tokenError || null },
       idtoken: { status: idDec ? 'done' : t ? 'skipped' : 'idle', data: idDec ? { id_token: t.id_token, header: idDec.header, claims: idDec.claims } : null },
-      gateway: { status: !g.length ? 'idle' : gOk ? 'done' : 'error', data: g.length ? { calls: g.slice(-8), audience_matches_gateway: dec?.claims?.aud === GATEWAY_URL, token_audience: dec?.claims?.aud, gateway: GATEWAY_URL } : null },
-      sts: { status: stsS, data: stsS !== 'idle' ? { consentUrl, logAvailable: !!LOG_TOKEN, checkedAt: ev?.checkedAt, exchange: ev?.exchange || null, reused: !!ev?.reused, lastExchange: ev?.latest || null, consentOnFile: ev?.consent || null, oktaGatewayEvents: (ev?.window || []).filter((e) => e.eventType.startsWith('agent_gateway.')) } : null },
+      gateway: { status: !g.length ? 'idle' : gOk ? 'done' : 'error', data: g.length ? { calls: g.slice(-8), audience_matches_gateway: dec?.claims?.aud === req.tenant.gatewayUrl, token_audience: dec?.claims?.aud, gateway: req.tenant.gatewayUrl } : null },
+      sts: { status: stsS, data: stsS !== 'idle' ? { consentUrl, logAvailable: !!req.tenant.logToken, checkedAt: ev?.checkedAt, exchange: ev?.exchange || null, reused: !!ev?.reused, lastExchange: ev?.latest || null, consentOnFile: ev?.consent || null, oktaGatewayEvents: (ev?.window || []).filter((e) => e.eventType.startsWith('agent_gateway.')) } : null },
       ghtoken: { status: stsS === 'waiting' ? 'idle' : stsS, data: stsS !== 'idle' && stsS !== 'waiting' ? { visible: false, held_by: 'Okta. Never sent to this app or to the agent.', reused: !!ev?.reused, returned: ghRec ? { tokenTypes: ghRec.returnedTokenTypes, at: ghRec.at, responseTimeMs: ghRec.responseTimeMs, targetResourceOrn: ghRec.targetResourceOrn } : null, consentOnFile: ev?.consent ? { at: ev.consent.at, persistedTokenTypes: ev.consent.persistedTokenTypes } : null } : null },
       toolcall: { status: callOk ? 'done' : (fl.toolCalls || []).length ? 'error' : 'idle', data: (fl.toolCalls || []).length ? { calls: fl.toolCalls.slice(-6) } : null },
     };
