@@ -47,4 +47,8 @@ test('trust proxy: a hop count becomes a number, anything else stays text', () =
   assert.equal(configFromEnv({ ...SINGLE, TRUST_PROXY: '1' }, { redisFactory }).trustProxy, 1);
   assert.equal(configFromEnv({ ...SINGLE, TRUST_PROXY: 'loopback' }, { redisFactory }).trustProxy, 'loopback');
   assert.equal(configFromEnv({ ...SINGLE }, { redisFactory }).trustProxy, undefined);
+  // On Vercel, TLS ends in front of the function; without trusting that hop the secure session cookie is never set.
+  const onVercel = { ...SINGLE, VERCEL: '1', SESSION_SECRET: 'x', KV_REST_API_URL: 'https://r', KV_REST_API_TOKEN: 't' };
+  assert.equal(configFromEnv(onVercel, { redisFactory }).trustProxy, 1);
+  assert.equal(configFromEnv({ ...onVercel, TRUST_PROXY: '2' }, { redisFactory }).trustProxy, 2, 'an explicit setting still wins');
 });

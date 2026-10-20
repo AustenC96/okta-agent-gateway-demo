@@ -25,7 +25,8 @@ export function configFromEnv(env, { store, defer, redisFactory, log = console.l
     origin = u.origin;
   }
   const local = !origin || LOCAL_HOSTS.includes(new URL(origin).hostname);
-  const tp = env.TRUST_PROXY;
+  // Vercel ends TLS in front of the function, so without trusting that one hop Express sees plain http and never sets the secure session cookie.
+  const tp = env.TRUST_PROXY || (env.VERCEL ? '1' : undefined);
 
   // Where state lives. A shared Redis is required on serverless hosts; otherwise it stays in this process's memory.
   const redisUrl = env.UPSTASH_REDIS_REST_URL || env.KV_REST_API_URL;
