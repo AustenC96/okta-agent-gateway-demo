@@ -57,9 +57,18 @@ export function createBootstrap({
 // Which OIDC client the Agent Gateway flow should use, and where the gateway URL comes from, is still being confirmed with
 // Demo Engineering, so for now both come from this record: the client from oidc_configuration and the gateway from the
 // component setting `gatewayUrl`.
+// The gateway URL is pasted by whoever attaches the component and the server calls it, so it must be an https Okta gateway address.
+export function validGatewayUrl(raw) {
+  try {
+    const u = new URL(String(raw).trim());
+    const hostOk = /(^|\.)(oktapreview|okta|okta-emea)\.com$/.test(u.hostname);
+    return u.protocol === 'https:' && hostOk && !u.username && !u.password && !u.port && !u.search && !u.hash && u.pathname.length > 1 ? u.href : null;
+  } catch { return null; }
+}
+
 export function toTenant(b) {
   const o = b?.oidc_configuration;
-  const gatewayUrl = b?.settings?.gatewayUrl;
+  const gatewayUrl = validGatewayUrl(b?.settings?.gatewayUrl);
   if (!o?.issuer || !o.client_id || !gatewayUrl) return null;
   let orgUrl;
   try { orgUrl = new URL(String(o.issuer).startsWith('http') ? o.issuer : `https://${o.issuer}`).origin; } catch { return null; }

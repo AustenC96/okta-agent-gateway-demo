@@ -7,6 +7,7 @@
 // Changes inside a demo's Okta org are stubs behind a flag until it is confirmed which client and scopes we may use.
 import express from 'express';
 import { NAME_RE } from './tenant.js';
+import { shape, safeValues } from './shape.js';
 
 // The component form names the hooks request/attach/update/execute/detach; create and destroy are the deprecated names for attach and detach.
 const EVENTS = { request: 'request', attach: 'create', create: 'create', update: 'update', detach: 'delete', delete: 'delete', destroy: 'delete', execute: 'execute' };
@@ -66,6 +67,7 @@ export function createHooks({ bootstrap, tenantChanges = false, allowedCallbackH
   router.post('/:event', (req, res) => {
     const type = EVENTS[req.params.event];
     if (!type) return res.sendStatus(404);
+    log('hook payload shape', { event: req.params.event, shape: shape(req.body), settings: safeValues((req.body?.component || req.body?.application)?.settings) });
     const ev = normalize(req.params.event, req.body);
     if (!ev.demoName || !NAME_RE.test(ev.demoName)) return res.status(400).json({ error: 'Missing or invalid demo name' });
     res.sendStatus(202);                                 // acknowledge first; the platform waits only a few seconds

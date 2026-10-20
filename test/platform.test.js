@@ -1,7 +1,7 @@
 import test from 'node:test';
 import assert from 'node:assert/strict';
 import express from 'express';
-import { createBootstrap, toTenant } from '../bootstrap.js';
+import { createBootstrap, toTenant, validGatewayUrl } from '../bootstrap.js';
 import { createHooks, normalize, callbackAllowed } from '../hooks.js';
 import { startApp, browser } from './helpers.js';
 
@@ -29,7 +29,7 @@ function fakePlatform({ demos = {}, tokenFor = () => jwt(Math.floor(Date.now() /
   return { fetchImpl, calls };
 }
 const mk = (p, extra = {}) => createBootstrap({ appId: 'APP1', clientId: 'id', clientSecret: 'sec', endpoint: 'https://api.test', tokenEndpoint: 'https://auth.test/oauth/token', fetchImpl: p.fetchImpl, ...extra });
-const DEMO = { settings: { gatewayUrl: 'https://gw.example.com/mcp/servers/x' }, oidc_configuration: { issuer: 'acme.okta.com', client_id: 'cid', client_secret: 'csec' } };
+const DEMO = { settings: { gatewayUrl: 'https://acme.gateway.oktapreview.com/mcp/servers/x' }, oidc_configuration: { issuer: 'acme.okta.com', client_id: 'cid', client_secret: 'csec' } };
 
 test('bootstrap: fetches with a bearer token, caches the token and the demo', async () => {
   const p = fakePlatform({ demos: { 'my-demo': DEMO } }); const b = mk(p);
@@ -159,4 +159,14 @@ test('multi-tenant app: demos are resolved through the tenant lookup and webhook
     const hook = await fetch(app.base + '/hooks/request', { method: 'POST', headers: { 'content-type': 'application/json' }, body: JSON.stringify({ demonstration: { name: 'my-demo' } }) });
     assert.equal(hook.status, 202); assert.equal(hook.headers.get('set-cookie'), null);
   } finally { await app.close(); }
+});
+
+test('toTenant accepts only an https Okta gateway address in the pasted setting', () => {
+  const ok = 'https://demo-agent-gateway.gateway.oktapreview.com/mcp/servers/agent-gateway-agent-gateway';
+  assert.equal(validGatewayUrl(`  ${ok} `), ok);
+  for (const bad of ['http://a.gateway.oktapreview.com/mcp/x', 'https://169.254.169.254/mcp/x', 'https://localhost/mcp/x', 'https://evil.example.com/mcp/x',
+    'https://a.oktapreview.com.evil.com/mcp/x', 'https://u:p@a.oktapreview.com/mcp/x', 'https://a.oktapreview.com:8443/mcp/x', 'https://a.oktapreview.com/', 'not a url', '', undefined]) {
+    assert.equal(validGatewayUrl(bad), null, String(bad));
+  }
+  assert.equal(toTenant({ ...DEMO, settings: { gatewayUrl: 'https://evil.example.com/mcp/x' } }), null);
 });
