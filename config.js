@@ -45,7 +45,7 @@ export function configFromEnv(env, { store, defer, redisFactory, log = console.l
       resolution: { strategy, baseHost: new URL(origin).hostname },
       getTenant: async (name) => (name === 'default' ? null : toTenant(await bootstrap.get(name))),
       // Changes inside a demo's Okta org stay off until Demo Engineering confirms which client and scopes we may use.
-      hooks: createHooks({ bootstrap, defer, tenantChanges: env.HOOKS_MODIFY_TENANT === 'true', log: (m, d) => log('[hooks]', m, JSON.stringify(d || {})) }),
+      hooks: createHooks({ bootstrap, baseUri: origin, defer, tenantChanges: env.HOOKS_MODIFY_TENANT === 'true', log: (m, d) => log('[hooks]', m, JSON.stringify(d || {})) }),
     };
   }
   return {

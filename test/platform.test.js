@@ -91,11 +91,11 @@ async function hookServer(opts = {}) {
 const CB = 'https://api.demo.okta.com/demonstration/lifecycle/abc';
 
 test('hooks: a genuine create is acknowledged with 202, then reported finished to the callback', async () => {
-  const h = await hookServer();
+  const h = await hookServer({ baseUri: 'https://app.example.com' });
   try {
     const r = await h.post('create', { event: { callback: CB }, demonstration: { name: 'my-demo' } });
     assert.equal(r.status, 202); await Promise.all(h.pending);
-    assert.deepEqual(h.p.calls.patched, [{ url: CB, body: { state: 'finish', message: 'Agent Gateway demo configured' } }]);
+    assert.deepEqual(h.p.calls.patched, [{ url: CB, body: { state: 'finish', message: 'Agent Gateway demo configured', launchUrl: 'https://app.example.com/?demoName=my-demo' } }]);
     assert.ok(h.log.some(([m]) => /tenant changes disabled/.test(m)), 'nothing is modified while the flag is off');
   } finally { await h.close(); }
 });
@@ -169,4 +169,16 @@ test('toTenant accepts only an https Okta gateway address in the pasted setting'
     assert.equal(validGatewayUrl(bad), null, String(bad));
   }
   assert.equal(toTenant({ ...DEMO, settings: { gatewayUrl: 'https://evil.example.com/mcp/x' } }), null);
+});
+
+test('hooks: the launch link is only sent on success, and settings are read from either payload shape', async () => {
+  const h = await hookServer({ baseUri: 'https://app.example.com' });
+  try {
+    await h.post('attach', { event: { callback: CB }, demonstration: { name: 'ghost' } }); await Promise.all(h.pending);
+    assert.equal(h.p.calls.patched[0].body.state, 'fail'); assert.equal('launchUrl' in h.p.calls.patched[0].body, false);
+  } finally { await h.close(); }
+  const viaComponent = normalize('attach', { demonstration: { name: 'd' }, component: { settings: { gatewayUrl: 'https://a' } } });
+  const viaApplication = normalize('attach', { demonstration: { name: 'd' }, application: { settings: { gatewayUrl: { default: '', instance: 'https://b' } } } });
+  assert.equal(viaComponent.settings.gatewayUrl, 'https://a');
+  assert.equal(viaApplication.settings.gatewayUrl, 'https://b');
 });

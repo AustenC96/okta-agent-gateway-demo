@@ -12,6 +12,11 @@ import { shape, safeValues } from './shape.js';
 // The component form names the hooks request/attach/update/execute/detach; create and destroy are the deprecated names for attach and detach.
 const EVENTS = { request: 'request', attach: 'create', create: 'create', update: 'update', detach: 'delete', delete: 'delete', destroy: 'delete', execute: 'execute' };
 
+// application.settings wraps each value as { default, instance }; component.settings is already plain. Prefer the user's value.
+function plainSettings(raw) {
+  return Object.fromEntries(Object.entries(raw || {}).map(([k, v]) => [k, v && typeof v === 'object' && 'default' in v ? (v.instance || v.default) : v]));
+}
+
 // The platform's docs show two payload shapes (event/component/oidcConfiguration and application/oidc_configuration); read both.
 export function normalize(type, body = {}) {
   const comp = body.component || body.application || {};
@@ -21,7 +26,7 @@ export function normalize(type, body = {}) {
     demoName: typeof body.demonstration?.name === 'string' ? body.demonstration.name.toLowerCase() : null,
     owner: body.demonstration?.owner || null,
     idpType: body.idp?.type || null,
-    settings: comp.settings || {},
+    settings: plainSettings(comp.settings),
     oidc: comp.oidcConfiguration || comp.oidc_configuration || null,
   };
 }
@@ -31,7 +36,7 @@ export function callbackAllowed(raw, allowedHosts = ['api.demo.okta.com']) {
   catch { return false; }
 }
 
-export function createHooks({ bootstrap, tenantChanges = false, allowedCallbackHosts, fetchImpl = fetch, log = () => {}, defer = (p) => p.catch(() => {}), actions = {} }) {
+export function createHooks({ bootstrap, baseUri, tenantChanges = false, allowedCallbackHosts, fetchImpl = fetch, log = () => {}, defer = (p) => p.catch(() => {}), actions = {} }) {
   const router = express.Router();
   router.use(express.json({ limit: '256kb' }));
 
@@ -57,7 +62,9 @@ export function createHooks({ bootstrap, tenantChanges = false, allowedCallbackH
         if (tenantChanges && actions[type]) await actions[type](ev, known);
         else log('tenant changes disabled; nothing modified', { demoName, type });
       }
-      if (callback) await patchCallback(callback, { state: 'finish', message: 'Agent Gateway demo configured' });
+      // launchUrl is what the platform shows as the component's launch link; the query form is how this app finds the demo.
+      const launchUrl = baseUri ? `${baseUri}/?demoName=${encodeURIComponent(demoName)}` : undefined;
+      if (callback) await patchCallback(callback, { state: 'finish', message: 'Agent Gateway demo configured', ...(launchUrl && { launchUrl }) });
     } catch (e) {
       log('hook failed', { demoName, type, error: String(e.message || e) });
       if (callback) await patchCallback(callback, { state: 'fail', message: String(e.message || e).slice(0, 200) }).catch(() => {});
