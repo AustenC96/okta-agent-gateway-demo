@@ -95,8 +95,19 @@ test('hooks: a genuine create is acknowledged with 202, then reported finished t
   try {
     const r = await h.post('create', { event: { callback: CB }, demonstration: { name: 'my-demo' } });
     assert.equal(r.status, 202); await Promise.all(h.pending);
-    assert.deepEqual(h.p.calls.patched, [{ url: CB, body: { state: 'finish' } }]);
+    assert.deepEqual(h.p.calls.patched, [{ url: CB, body: { state: 'finish', message: 'Agent Gateway demo configured' } }]);
     assert.ok(h.log.some(([m]) => /tenant changes disabled/.test(m)), 'nothing is modified while the flag is off');
+  } finally { await h.close(); }
+});
+
+test('hooks: the form\'s attach and detach URLs are served like create and delete', async () => {
+  const h = await hookServer();
+  try {
+    assert.equal((await h.post('attach', { event: { callback: CB }, demonstration: { name: 'my-demo' } })).status, 202); await Promise.all(h.pending);
+    assert.equal(h.p.calls.patched[0].body.state, 'finish');
+    await h.bootstrap.get('my-demo'); assert.equal(h.bootstrap.cacheSize(), 1);
+    assert.equal((await h.post('detach', { demonstration: { name: 'my-demo' } })).status, 202); await Promise.all(h.pending);
+    assert.equal(h.bootstrap.cacheSize(), 0);
   } finally { await h.close(); }
 });
 

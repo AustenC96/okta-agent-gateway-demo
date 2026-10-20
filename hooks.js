@@ -8,7 +8,8 @@
 import express from 'express';
 import { NAME_RE } from './tenant.js';
 
-const EVENTS = { request: 'request', create: 'create', update: 'update', delete: 'delete', destroy: 'delete', execute: 'execute' };
+// The component form names the hooks request/attach/update/execute/detach; create and destroy are the deprecated names for attach and detach.
+const EVENTS = { request: 'request', attach: 'create', create: 'create', update: 'update', detach: 'delete', delete: 'delete', destroy: 'delete', execute: 'execute' };
 
 // The platform's docs show two payload shapes (event/component/oidcConfiguration and application/oidc_configuration); read both.
 export function normalize(type, body = {}) {
@@ -50,12 +51,12 @@ export function createHooks({ bootstrap, tenantChanges = false, allowedCallbackH
       if (type === 'request') return;                    // nothing to veto yet
       bootstrap.evict(demoName);                         // update/create/execute must see fresh settings
       const known = await bootstrap.get(demoName);
-      if (!known) { log('ignored: platform does not know this demo', { demoName, type }); if (callback) await patchCallback(callback, { state: 'fail', message: 'Demo not found' }); return; }
+      if (!known) { log('ignored: platform does not know this demo', { demoName, type }); if (callback) await patchCallback(callback, { state: 'fail', message: 'Demo not found', level: 'error' }); return; }
       if (type === 'create' || type === 'update') {
         if (tenantChanges && actions[type]) await actions[type](ev, known);
         else log('tenant changes disabled; nothing modified', { demoName, type });
       }
-      if (callback) await patchCallback(callback, { state: 'finish' });
+      if (callback) await patchCallback(callback, { state: 'finish', message: 'Agent Gateway demo configured' });
     } catch (e) {
       log('hook failed', { demoName, type, error: String(e.message || e) });
       if (callback) await patchCallback(callback, { state: 'fail', message: String(e.message || e).slice(0, 200) }).catch(() => {});

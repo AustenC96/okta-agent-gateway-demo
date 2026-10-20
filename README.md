@@ -71,7 +71,7 @@ verified against the real platform**; several details are still being confirmed 
 | `HOOKS_MODIFY_TENANT` | `true` lets the create/update/delete webhooks change a demo's Okta org. Off by default. |
 
 In this mode each demo's settings come from Bootstrap. Lifecycle webhooks are served at `/hooks/<event>`
-(`request`, `create`, `update`, `delete` or `destroy`, `execute`).
+(`request`, `attach`, `update`, `detach`, `execute`; `create`, `delete` and `destroy` are accepted as older names).
 
 ### Hosting on Vercel (prepared, not yet deployed)
 `api/index.js` and `vercel.json` run the whole app as one Vercel function. Requests are stateless there, so a shared Redis
