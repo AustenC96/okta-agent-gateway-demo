@@ -5,8 +5,13 @@ let eventCount = 0;
 // Declared up here because renderEvent() runs during the post-Okta trace replay, before the rest of the file has executed.
 const flow = { nodes: null, sig: {}, selected: null, pinned: false, lastNode: null, timer: null };
 
+// The launch link is /?demoName=<demo>. On a static host the page is served without the server seeing that query,
+// so every call carries it, and the server learns which demo this is from whichever call arrives first.
+const demoName = new URLSearchParams(location.search).get('demoName');
+const withDemo = (path) => (demoName ? path + (path.includes('?') ? '&' : '?') + 'demoName=' + encodeURIComponent(demoName) : path);
+
 async function api(path, body) {
-  const r = await fetch(path, { method: body === undefined ? 'GET' : 'POST', headers: { 'Content-Type': 'application/json' }, body: body === undefined ? undefined : JSON.stringify(body) });
+  const r = await fetch(withDemo(path), { method: body === undefined ? 'GET' : 'POST', headers: { 'Content-Type': 'application/json' }, body: body === undefined ? undefined : JSON.stringify(body) });
   return r.json().catch(() => ({}));
 }
 
@@ -17,8 +22,23 @@ const carried = JSON.parse(sessionStorage.getItem('carriedTrace') || 'null');
 sessionStorage.removeItem('carriedTrace');
 const seen = [];
 let lastId = 0;
-const es = new EventSource(carried ? `/api/events?after=${carried.lastId}` : '/api/events');
-es.onmessage = (m) => renderEvent(JSON.parse(m.data), false);
+// The server says how to follow the trace: a live stream, or short polls on hosts that cannot hold a stream open.
+// Either way an event is shown once: ids only ever go up, so anything at or below the last one shown is skipped.
+function showLive(ev) { if ((ev.id || 0) > lastId) renderEvent(ev, false); }
+(async () => {
+  const mode = (await api('/api/transport')).mode;
+  if (mode === 'poll') {
+    let after = carried ? carried.lastId : (await api('/api/events/poll?init=1')).head || 0;
+    const tick = async () => {
+      try { const r = await api(`/api/events/poll?after=${after}`); for (const ev of r.events || []) showLive(ev); after = Math.max(after, r.head || 0); } catch { /* try again next tick */ }
+      setTimeout(tick, document.hidden ? 4000 : 1000);
+    };
+    tick();
+  } else {
+    const es = new EventSource(withDemo(carried ? `/api/events?after=${carried.lastId}` : '/api/events'));
+    es.onmessage = (m) => showLive(JSON.parse(m.data));
+  }
+})();
 document.addEventListener('click', (e) => {
   if (e.target.closest('a[href="/auth/login"]')) sessionStorage.setItem('carriedTrace', JSON.stringify({ events: seen, lastId }));
 });
@@ -270,7 +290,7 @@ function renderDetail() {
       if (d.consentUrl) html += `<div class="note warn">Okta has no GitHub grant for this user yet, so it needs a one-time consent. <a href="${esc(d.consentUrl)}" target="_blank" rel="noopener" style="color:var(--warn);font-weight:600">Authorize GitHub →</a> then retry.</div>`;
       else if (d.exchange) html += `<div class="note">Confirmed by Okta’s System Log at ${when(Date.parse(d.exchange.at))}: <b>${esc(d.exchange.result)}</b>. The gateway signed in as its own workload identity (${esc(d.exchange.clientAuthType)}), presented this agent’s access token as the subject, and Okta checked delegation link <code>${esc(d.exchange.delegationLinkId)}</code> and resource connection <code>${esc(d.exchange.resourceConnectionId)}</code> before returning a GitHub token in ${esc(d.exchange.responseTimeMs)} ms. No consent prompt appears because you already authorized GitHub earlier${d.consentOnFile ? ` (${when(Date.parse(d.consentOnFile.at))})` : ''}, and Okta kept the grant.</div>`;
       else if (d.reused) html += `<div class="note">Okta’s log shows no new exchange for this call, so the gateway reused a GitHub token it already held. The latest exchange for this agent was at ${when(Date.parse(d.lastExchange.at))}.</div>`;
-      else html += `<div class="note warn">${d.logAvailable ? 'The call succeeded, so an exchange happened, but Okta’s System Log has no record of it yet (it can lag by several seconds). This stage will turn green when the record appears.' : 'This happens inside Okta and can’t be observed directly. Set OKTA_API_TOKEN (in your shell or .env) and restart the server to read Okta’s System Log record of the exchange.'}</div>`;
+      else html += `<div class="note warn">${d.logAvailable ? 'The call succeeded, so an exchange happened, but Okta’s System Log has no record of it yet (it can lag by several seconds). This stage will turn green when the record appears.' : 'This happens inside Okta and can’t be observed directly. Okta’s System Log evidence isn’t enabled for this demo, so this stage is shown as inferred.'}</div>`;
       for (const k of ['consentUrl', 'logAvailable', 'checkedAt', 'reused']) delete rest[k];
     }
     if (id === 'ghtoken') {
