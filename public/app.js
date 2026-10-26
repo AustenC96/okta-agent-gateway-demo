@@ -5,8 +5,13 @@ let eventCount = 0;
 // Declared up here because renderEvent() runs during the post-Okta trace replay, before the rest of the file has executed.
 const flow = { nodes: null, sig: {}, selected: null, pinned: false, lastNode: null, timer: null };
 
+// The launch link is /?demoName=<demo>. On a static host the page is served without the server seeing that query,
+// so every call carries it, and the server learns which demo this is from whichever call arrives first.
+const demoName = new URLSearchParams(location.search).get('demoName');
+const withDemo = (path) => (demoName ? path + (path.includes('?') ? '&' : '?') + 'demoName=' + encodeURIComponent(demoName) : path);
+
 async function api(path, body) {
-  const r = await fetch(path, { method: body === undefined ? 'GET' : 'POST', headers: { 'Content-Type': 'application/json' }, body: body === undefined ? undefined : JSON.stringify(body) });
+  const r = await fetch(withDemo(path), { method: body === undefined ? 'GET' : 'POST', headers: { 'Content-Type': 'application/json' }, body: body === undefined ? undefined : JSON.stringify(body) });
   return r.json().catch(() => ({}));
 }
 
@@ -30,7 +35,7 @@ function showLive(ev) { if ((ev.id || 0) > lastId) renderEvent(ev, false); }
     };
     tick();
   } else {
-    const es = new EventSource(carried ? `/api/events?after=${carried.lastId}` : '/api/events');
+    const es = new EventSource(withDemo(carried ? `/api/events?after=${carried.lastId}` : '/api/events'));
     es.onmessage = (m) => showLive(JSON.parse(m.data));
   }
 })();
