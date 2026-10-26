@@ -198,6 +198,18 @@ export function createApp(config) {
   app.use(express.json());
   // Scripts and styles do not need a session, so serve them before it; the page itself is served after the tenant check below.
   app.use(express.static(path.join(__dirname, 'public'), { index: false }));
+  // Client ID Metadata Document: lets Okta register this app as a CIMD client whose client_id is this URL. It is public metadata,
+  // needs no session or tenant, and is served before both. A public client: no secret, PKCE protects the code exchange.
+  if (config.origin) {
+    const cimdUrl = `${config.origin}/cimd.json`;
+    app.get('/cimd.json', (_req, res) => {
+      res.set('Cache-Control', 'public, max-age=300');
+      res.json({
+        client_id: cimdUrl, client_name: 'Agent Gateway: Interactive Flow Demo', client_uri: config.origin,
+        redirect_uris: [`${config.origin}/callback`], grant_types: ['authorization_code'], response_types: ['code'], token_endpoint_auth_method: 'none',
+      });
+    });
+  }
   app.use(session({
     store: store.sessionStore(), secret: config.sessionSecret || crypto.randomBytes(32).toString('hex'), resave: false, saveUninitialized: true,
     cookie: { sameSite: 'lax', httpOnly: true, secure: !!config.origin && config.origin.startsWith('https:') },

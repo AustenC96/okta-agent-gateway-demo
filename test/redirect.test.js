@@ -99,3 +99,18 @@ test('a tenant that registered /callback is sent there and the callback route an
     assert.equal(back.status, 302);
   } finally { await app.close(); await gw.close(); }
 });
+
+test('the CIMD document is public, names itself as client_id and lists the platform callback', async () => {
+  const gw = await gateway();
+  const app = await startApp({ gatewayUrl: gw.url, origin: 'https://demo.example.com', trustProxy: 1 });
+  try {
+    const r = await fetch(app.base + '/cimd.json');
+    assert.equal(r.status, 200);
+    assert.equal(r.headers.get('set-cookie'), null);
+    const d = await r.json();
+    assert.equal(d.client_id, 'https://demo.example.com/cimd.json');
+    assert.deepEqual(d.redirect_uris, ['https://demo.example.com/callback']);
+    assert.equal(d.token_endpoint_auth_method, 'none');
+    assert.ok(!('client_secret' in d));
+  } finally { await app.close(); await gw.close(); }
+});
