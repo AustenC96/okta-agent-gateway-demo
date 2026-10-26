@@ -84,3 +84,18 @@ test('with an https public address, no session cookie is issued over plain http 
     assert.equal(res.headers.get('set-cookie'), null);
   } finally { await app.close(); }
 });
+
+test('a tenant that registered /callback is sent there and the callback route answers on it', async () => {
+  const gw = await gateway();
+  const tenant = { orgUrl: 'https://acme.okta.com', gatewayUrl: gw.url, clientId: 'cid', clientSecret: 's', callbackPath: '/callback' };
+  const app = await startApp({ origin: 'https://demo.example.com', trustProxy: 1, getTenant: async () => tenant });
+  try {
+    const b = browser(app.base, { 'x-forwarded-proto': 'https' });
+    await b('/api/discover', { method: 'POST' });
+    const login = await b('/auth/login');
+    const u = new URL(login.headers.get('location'));
+    assert.equal(u.searchParams.get('redirect_uri'), 'https://demo.example.com/callback');
+    const back = await b(`/callback?code=abc&state=${u.searchParams.get('state')}`);
+    assert.equal(back.status, 302);
+  } finally { await app.close(); await gw.close(); }
+});

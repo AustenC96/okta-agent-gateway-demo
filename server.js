@@ -115,6 +115,9 @@ export function stsStatus({ sts, consentUrl, callOk }) {
   return callOk ? 'inferred' : 'idle';
 }
 
+// The platform registers /callback on the client it creates; the single-tenant setup registers /authorization-code/callback.
+const CALLBACK_PATHS = ['/authorization-code/callback', '/callback'];
+
 // Builds one self-contained app. All mutable state (trace, discovery results, STS evidence) lives inside this closure,
 // so each call gets its own state and nothing leaks between instances.
 export function createApp(config) {
@@ -128,7 +131,7 @@ export function createApp(config) {
     if (!t) return null;
     const origin = t.origin || config.origin || `http://localhost:${config.port}`;
     const gw = new URL(t.gatewayUrl);
-    return { ...t, name, origin, redirectUri: `${origin}/authorization-code/callback`, gatewayOrigin: gw.origin, gatewayPath: gw.pathname };
+    return { ...t, name, origin, redirectUri: `${origin}${t.callbackPath || '/authorization-code/callback'}`, gatewayOrigin: gw.origin, gatewayPath: gw.pathname };
   };
 
   // ---------- event log (every real HTTP call lands here) ----------
@@ -210,7 +213,7 @@ export function createApp(config) {
   app.use(async (req, res, next) => {
     try {
       let name;
-      if (req.path === '/authorization-code/callback' && req.session.tenant) name = req.session.tenant;
+      if (CALLBACK_PATHS.includes(req.path) && req.session.tenant) name = req.session.tenant;
       else {
         const r = tenantNameFrom(req, resolution);
         if (r.invalid) return res.status(400).json({ error: 'Invalid demo name' });
@@ -362,7 +365,7 @@ export function createApp(config) {
     res.redirect(u.toString());
   });
 
-  app.get('/authorization-code/callback', async (req, res) => {
+  app.get(CALLBACK_PATHS, async (req, res) => {
     const { code, state, error, error_description } = req.query;
     req.session.returnedFromOkta = true; // success or failure, the page that loads next is the return from Okta
     req.session.discovered = true;
@@ -380,7 +383,7 @@ export function createApp(config) {
     }
     F(req).code = code;
     await emit(req.sessionID, {
-      step: 'login', node: 'code', label: 'Okta sent the user back with an authorization code', method: 'GET (browser redirect)', url: `${req.tenant.origin}/authorization-code/callback`,
+      step: 'login', node: 'code', label: 'Okta sent the user back with an authorization code', method: 'GET (browser redirect)', url: `${req.tenant.origin}${req.path}`,
       request: { headers: {}, body: { code: mask(code), state: mask(state) } }, response: null, ms: 0, outcome: 'ok',
       narration: 'The user signed in and Okta redirected the browser back with a one-time authorization code. The code is useless on its own: it can only be redeemed together with the PKCE secret that only this app holds, and only once.',
     });

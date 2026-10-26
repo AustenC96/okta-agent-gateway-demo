@@ -63,7 +63,7 @@ test('bootstrap: requires credentials and surfaces platform errors', async () =>
 });
 
 test('toTenant maps a bootstrap record and rejects incomplete ones', () => {
-  assert.deepEqual(toTenant(DEMO), { orgUrl: 'https://acme.okta.com', gatewayUrl: DEMO.settings.gatewayUrl, clientId: 'cid', clientSecret: 'csec' });
+  assert.deepEqual(toTenant(DEMO), { orgUrl: 'https://acme.okta.com', gatewayUrl: DEMO.settings.gatewayUrl, clientId: 'cid', clientSecret: 'csec', callbackPath: '/callback' });
   assert.equal(toTenant({ settings: {}, oidc_configuration: DEMO.oidc_configuration }), null);
   assert.equal(toTenant({ settings: DEMO.settings, oidc_configuration: { issuer: 'x' } }), null);
   assert.equal(toTenant(null), null);

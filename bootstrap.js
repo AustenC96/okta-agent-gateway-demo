@@ -72,5 +72,5 @@ export function toTenant(b) {
   if (!o?.issuer || !o.client_id || !gatewayUrl) return null;
   let orgUrl;
   try { orgUrl = new URL(String(o.issuer).startsWith('http') ? o.issuer : `https://${o.issuer}`).origin; } catch { return null; }
-  return { orgUrl, gatewayUrl, clientId: o.client_id, clientSecret: o.client_secret };
+  return { orgUrl, gatewayUrl, clientId: o.client_id, clientSecret: o.client_secret, callbackPath: '/callback' };
 }
