@@ -1,9 +1,8 @@
 import test from 'node:test';
 import assert from 'node:assert/strict';
-import { createMemoryStore, createRedisStore } from '../store.js';
-import { fakeRedis } from './fakeRedis.js';
+import { createMemoryStore } from '../store.js';
 
-for (const [name, make] of [['memory', () => createMemoryStore()], ['redis', () => createRedisStore(fakeRedis())]]) {
+for (const [name, make] of [['memory', () => createMemoryStore()]]) {
   test(`${name} store: events get increasing ids, list honours "after", sessions are separate`, async () => {
     const s = make();
     const a1 = await s.append('A', { label: 'one' }), a2 = await s.append('A', { label: 'two' }), b1 = await s.append('B', { label: 'other' });
@@ -44,16 +43,4 @@ for (const [name, make] of [['memory', () => createMemoryStore()], ['redis', () 
 test('memory store: keys and idle traces expire', async () => {
   let t = 1_000_000; const s = createMemoryStore({ now: () => t });
   await s.put('k', { a: 1 }, 10); t += 9_000; assert.deepEqual(await s.take('k'), { a: 1 }); t += 2_000; assert.equal(await s.take('k'), null);
-});
-
-test('redis session store round-trips a session and expires it with the cookie', async () => {
-  const s = createRedisStore(fakeRedis()).sessionStore();
-  const call = (fn, ...a) => new Promise((res, rej) => fn.call(s, ...a, (e, v) => (e ? rej(e) : res(v))));
-  const sess = { cookie: { expires: new Date(Date.now() + 60_000).toISOString() }, tokens: { a: 1 } };
-  await call(s.set, 'sid1', sess);
-  assert.equal((await call(s.get, 'sid1')).tokens.a, 1);
-  assert.equal(await call(s.get, 'missing'), null);
-  await call(s.touch, 'sid1', sess);
-  await call(s.destroy, 'sid1'); assert.equal(await call(s.get, 'sid1'), null);
-  assert.ok(s.ttl({ cookie: {} }) === 86400 && s.ttl({ cookie: { expires: new Date(Date.now() - 5000) } }) === 1);
 });

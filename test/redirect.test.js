@@ -85,32 +85,18 @@ test('with an https public address, no session cookie is issued over plain http 
   } finally { await app.close(); }
 });
 
-test('a tenant that registered /callback is sent there and the callback route answers on it', async () => {
+test('a persona whose client registered /callback is sent there and the callback route answers on it', async () => {
   const gw = await gateway();
-  const tenant = { orgUrl: 'https://acme.okta.com', gatewayUrl: gw.url, clientId: 'cid', clientSecret: 's', callbackPath: '/callback' };
-  const app = await startApp({ origin: 'https://demo.example.com', trustProxy: 1, getTenant: async () => tenant });
+  const persona = { key: 'ethan', name: 'Ethan', department: 'Engineering', login: 'e@x.test', agent: 'A', gatewayLabel: 'G', gatewayUrl: gw.url, clientId: 'cid', clientSecret: 's', callbackPath: '/callback', configured: true, blockedTools: [] };
+  const app = await startApp({ origin: 'https://demo.example.com', trustProxy: 1, personas: [persona] });
   try {
     const b = browser(app.base, { 'x-forwarded-proto': 'https' });
+    await b('/api/persona', { method: 'POST', headers: { 'content-type': 'application/json' }, body: JSON.stringify({ key: 'ethan' }) });
     await b('/api/discover', { method: 'POST' });
     const login = await b('/auth/login');
     const u = new URL(login.headers.get('location'));
     assert.equal(u.searchParams.get('redirect_uri'), 'https://demo.example.com/callback');
     const back = await b(`/callback?code=abc&state=${u.searchParams.get('state')}`);
     assert.equal(back.status, 302);
-  } finally { await app.close(); await gw.close(); }
-});
-
-test('the CIMD document is public, names itself as client_id and lists the platform callback', async () => {
-  const gw = await gateway();
-  const app = await startApp({ gatewayUrl: gw.url, origin: 'https://demo.example.com', trustProxy: 1 });
-  try {
-    const r = await fetch(app.base + '/cimd.json');
-    assert.equal(r.status, 200);
-    assert.equal(r.headers.get('set-cookie'), null);
-    const d = await r.json();
-    assert.equal(d.client_id, 'https://demo.example.com/cimd.json');
-    assert.deepEqual(d.redirect_uris, ['https://demo.example.com/callback']);
-    assert.equal(d.token_endpoint_auth_method, 'none');
-    assert.ok(!('client_secret' in d));
   } finally { await app.close(); await gw.close(); }
 });

@@ -4,12 +4,10 @@ import session from 'express-session';
 import crypto from 'node:crypto';
 import path from 'node:path';
 import { fileURLToPath, pathToFileURL } from 'node:url';
-import { tenantNameFrom } from './tenant.js';
 import { createMemoryStore } from './store.js';
 import { configFromEnv } from './config.js';
 import { publicPersona } from './personas.js';
 import { callVerdict, blockedVerdict, probeVerdict } from './verdicts.js';
-import { Redis } from '@upstash/redis';
 
 const __dirname = path.dirname(fileURLToPath(import.meta.url));
 
@@ -127,13 +125,12 @@ const CALLBACK_PATHS = ['/authorization-code/callback', '/callback'];
 // Builds one self-contained app. All mutable state (trace, discovery results, STS evidence) lives inside this closure,
 // so each call gets its own state and nothing leaks between instances.
 export function createApp(config) {
-  const resolution = config.resolution || { strategy: 'none' };
   const allowLocal = config.allowLocal ?? true; // local development: plain http and loopback hosts are fine
-  // A tenant is one demo's settings. With no getTenant, the one configured tenant is served as 'default'.
+  // A tenant is one set of settings: an agent's client and the gateway it uses. The configured Okta org is served as 'default', and each persona is a named tenant.
   const staticTenant = config.gatewayUrl && { name: 'default', orgUrl: config.orgUrl, gatewayUrl: config.gatewayUrl, clientId: config.clientId, clientSecret: config.clientSecret, callbackPath: config.callbackPath, logToken: config.logToken, origin: config.origin };
   const personaMap = new Map((config.personas || []).map((p) => [p.key, p]));
   const personaTenant = (p) => ({ name: p.key, orgUrl: config.orgUrl, gatewayUrl: p.gatewayUrl, clientId: p.clientId, clientSecret: p.clientSecret, callbackPath: p.callbackPath, logToken: config.logToken, origin: config.origin, persona: p });
-  const baseTenant = config.getTenant || (async (name) => (name === 'default' ? staticTenant : null));
+  const baseTenant = async (name) => (name === 'default' ? staticTenant : null);
   // A chosen persona is just a named tenant: its own agent client and its own gateway.
   const rawTenant = async (name) => (personaMap.has(name) ? (personaMap.get(name).configured ? personaTenant(personaMap.get(name)) : null) : baseTenant(name));
   const getTenant = async (name) => {
@@ -204,44 +201,24 @@ export function createApp(config) {
     app[m] = (path, ...fns) => (fns.length ? orig(path, ...fns.map((f) => (req, res, next) => Promise.resolve(f(req, res, next)).catch(next))) : orig(path));
   }
   if (config.trustProxy) app.set('trust proxy', config.trustProxy);
-  // Platform webhooks carry no cookie and name their own demo, so they sit before the session and tenant middleware.
-  if (config.hooks) app.use('/hooks', config.hooks);
   app.use(express.json());
   // Scripts and styles do not need a session, so serve them before it; the page itself is served after the tenant check below.
   app.use(express.static(path.join(__dirname, 'public'), { index: false }));
-  // Client ID Metadata Document: lets Okta register this app as a CIMD client whose client_id is this URL. It is public metadata,
-  // needs no session or tenant, and is served before both. A public client: no secret, PKCE protects the code exchange.
-  if (config.origin) {
-    const cimdUrl = `${config.origin}/cimd.json`;
-    app.get('/cimd.json', (_req, res) => {
-      res.set('Cache-Control', 'public, max-age=300');
-      res.json({
-        client_id: cimdUrl, client_name: 'Agent Gateway: Interactive Flow Demo', client_uri: config.origin,
-        redirect_uris: [`${config.origin}/callback`], grant_types: ['authorization_code'], response_types: ['code'], token_endpoint_auth_method: 'none',
-      });
-    });
-  }
   app.use(session({
     store: store.sessionStore(), secret: config.sessionSecret || crypto.randomBytes(32).toString('hex'), resave: false, saveUninitialized: true,
     cookie: { sameSite: 'lax', httpOnly: true, secure: !!config.origin && config.origin.startsWith('https:') },
   }));
   // Responses carry tokens and one-time codes, so they must never be cached by the browser or a proxy.
   app.use('/api', (_req, res, next) => { res.set('Cache-Control', 'no-store'); next(); });
-  // Resolve which demo this request is for. The OAuth callback always uses the tenant the sign-in started under,
-  // never anything in its own query string, and switching demos drops the previous demo's tokens.
+  // Resolve which settings this request uses: the chosen persona, or the default. The OAuth callback always uses the settings the
+  // sign-in started under, never anything in its own query string, and switching persona drops the previous persona's tokens.
   const resetAuth = async (req) => {
     Object.assign(req.session, { tokens: null, mcpSessionId: null, pkce: null, discovered: false, returnedFromOkta: false, flow: null });
     await store.drop('sts:' + req.sessionID);
   };
   app.use(async (req, res, next) => {
     try {
-      let name;
-      if (CALLBACK_PATHS.includes(req.path) && req.session.tenant) name = req.session.tenant;
-      else {
-        const r = tenantNameFrom(req, resolution);
-        if (r.invalid) return res.status(400).json({ error: 'Invalid demo name' });
-        name = r.name || (resolution.strategy === 'query' && req.session.tenant) || (personaMap.size && req.session.persona) || 'default';
-      }
+      const name = (CALLBACK_PATHS.includes(req.path) && req.session.tenant) || (personaMap.size && req.session.persona) || 'default';
       const tenant = await getTenant(name);
       if (!tenant) return res.status(404).json({ error: 'Unknown demo' });
       if (req.session.tenant && req.session.tenant !== name) await resetAuth(req);
@@ -361,7 +338,7 @@ export function createApp(config) {
     if (!asBase) return res.status(502).json({ error: 'No authorization server advertised by gateway' });
     const asUrl = safeUrl(asBase, { allowLocal });
     if (!asUrl) return res.status(502).json({ error: 'The advertised authorization server is not an allowed address' });
-    if (!allowLocal && asUrl.origin !== new URL(req.tenant.orgUrl).origin && !(req.tenant.authOrigins || []).includes(asUrl.origin)) {
+    if (!allowLocal && asUrl.origin !== new URL(req.tenant.orgUrl).origin) {
       return res.status(502).json({ error: 'The advertised authorization server is not this tenant’s Okta org' });
     }
     const as = await traced({
@@ -739,11 +716,11 @@ export function createApp(config) {
   return app;
 }
 
-// Run as a server only when executed directly (npm start), not when imported by tests or by the Vercel function.
+// Run as a server only when executed directly (npm start), not when imported by tests.
 if (process.argv[1] && import.meta.url === pathToFileURL(process.argv[1]).href) {
   dotenv.config();
   try {
-    const config = configFromEnv(process.env, { redisFactory: (o) => new Redis(o) });
+    const config = configFromEnv(process.env);
     const origin = config.origin;
     createApp(config).listen(config.port, () => console.log(`Agent Gateway demo listening on port ${config.port}, public address ${origin || `http://localhost:${config.port}`}`));
   } catch (e) { console.error(e.message); process.exit(1); }

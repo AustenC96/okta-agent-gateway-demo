@@ -2,8 +2,7 @@ import test from 'node:test';
 import assert from 'node:assert/strict';
 import http from 'node:http';
 import { startApp, browser } from './helpers.js';
-import { createRedisStore } from '../store.js';
-import { fakeRedis } from './fakeRedis.js';
+import { createMemoryStore } from '../store.js';
 
 function gateway() {
   return new Promise((resolve) => {
@@ -19,7 +18,7 @@ function gateway() {
   });
 }
 
-for (const [name, store] of [['memory', () => undefined], ['redis', () => createRedisStore(fakeRedis())]]) {
+for (const [name, store] of [['memory', () => undefined]]) {
   test(`poll (${name} store): a fresh load starts empty, then returns only new events, and visitors stay separate`, async () => {
     const gw = await gateway(); const app = await startApp({ gatewayUrl: gw.url, transport: 'poll', store: store() });
     try {
@@ -40,8 +39,8 @@ for (const [name, store] of [['memory', () => undefined], ['redis', () => create
   });
 }
 
-test('the stream still works on the shared store, and a store failure gives a clean 500 instead of a hang', async () => {
-  const gw = await gateway(); const store = createRedisStore(fakeRedis());
+test('the stream replays history, and a store failure gives a clean 500 instead of a hang', async () => {
+  const gw = await gateway(); const store = createMemoryStore();
   const app = await startApp({ gatewayUrl: gw.url, store });
   try {
     const b = browser(app.base);
@@ -53,7 +52,7 @@ test('the stream still works on the shared store, and a store failure gives a cl
     const ids = got.map((e) => e.id); assert.deepEqual(ids, [...ids].sort((a, c) => a - c)); assert.equal(new Set(ids).size, ids.length, 'no duplicates');
   } finally { await app.close(); await gw.close(); }
 
-  const broken = { ...createRedisStore(fakeRedis()), list: async () => { throw new Error('redis down'); }, head: async () => { throw new Error('redis down'); } };
+  const broken = { ...createMemoryStore(), list: async () => { throw new Error('store down'); }, head: async () => { throw new Error('store down'); } };
   const app2 = await startApp({ store: broken });
   try {
     const res = await Promise.race([fetch(app2.base + '/api/events/poll?after=0'), new Promise((_, rej) => setTimeout(() => rej(new Error('hung')), 3000))]);
