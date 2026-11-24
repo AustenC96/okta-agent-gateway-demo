@@ -7,6 +7,8 @@ import { fileURLToPath, pathToFileURL } from 'node:url';
 import { tenantNameFrom } from './tenant.js';
 import { createMemoryStore } from './store.js';
 import { configFromEnv } from './config.js';
+import { publicPersona } from './personas.js';
+import { callVerdict, blockedVerdict, probeVerdict } from './verdicts.js';
 import { Redis } from '@upstash/redis';
 
 const __dirname = path.dirname(fileURLToPath(import.meta.url));
@@ -68,6 +70,10 @@ const summarizeLog = (e) => {
   };
 };
 
+// Finds the link Okta returns when the user must consent first. It arrives as an MCP error, or as plain text in a tool result
+// ("Connection required: visit https://.../oauth2/v1/sts/redirect?dataHandle=..."), so search the whole response.
+export const findConsentUrl = (b) => JSON.stringify(b || {}).match(/https?:\/\/[^"\\\s]+(?:consent|interaction|authorize|sts\/redirect)[^"\\\s]*/i)?.[0] || null;
+
 // The client secret is POSTed to a URL that a remote server told us about, so every such URL is checked first.
 // Unless local hosts are allowed (local development), it must be https and must not point at a private, loopback,
 // link-local or cloud-metadata address. Only literal addresses and well-known names can be recognised here; a hostname
@@ -124,8 +130,12 @@ export function createApp(config) {
   const resolution = config.resolution || { strategy: 'none' };
   const allowLocal = config.allowLocal ?? true; // local development: plain http and loopback hosts are fine
   // A tenant is one demo's settings. With no getTenant, the one configured tenant is served as 'default'.
-  const staticTenant = config.gatewayUrl && { name: 'default', orgUrl: config.orgUrl, gatewayUrl: config.gatewayUrl, clientId: config.clientId, clientSecret: config.clientSecret, logToken: config.logToken, origin: config.origin };
-  const rawTenant = config.getTenant || (async (name) => (name === 'default' ? staticTenant : null));
+  const staticTenant = config.gatewayUrl && { name: 'default', orgUrl: config.orgUrl, gatewayUrl: config.gatewayUrl, clientId: config.clientId, clientSecret: config.clientSecret, callbackPath: config.callbackPath, logToken: config.logToken, origin: config.origin };
+  const personaMap = new Map((config.personas || []).map((p) => [p.key, p]));
+  const personaTenant = (p) => ({ name: p.key, orgUrl: config.orgUrl, gatewayUrl: p.gatewayUrl, clientId: p.clientId, clientSecret: p.clientSecret, callbackPath: p.callbackPath, logToken: config.logToken, origin: config.origin, persona: p });
+  const baseTenant = config.getTenant || (async (name) => (name === 'default' ? staticTenant : null));
+  // A chosen persona is just a named tenant: its own agent client and its own gateway.
+  const rawTenant = async (name) => (personaMap.has(name) ? (personaMap.get(name).configured ? personaTenant(personaMap.get(name)) : null) : baseTenant(name));
   const getTenant = async (name) => {
     const t = await rawTenant(name);
     if (!t) return null;
@@ -149,7 +159,7 @@ export function createApp(config) {
   const wrap = (fn) => (req, res, next) => Promise.resolve(fn(req, res, next)).catch(next);
 
   // A traced fetch: performs the real request and emits a structured event.
-  async function traced({ sid, step, node, label, method = 'GET', url, headers = {}, body, form, narrate }) {
+  async function traced({ sid, step, node, label, method = 'GET', url, headers = {}, body, form, narrate, outcomeOf, verdictOf }) {
     const started = Date.now();
     const reqHeaders = { ...headers };
     let payload;
@@ -179,7 +189,8 @@ export function createApp(config) {
       ms, error: error ? String(error.cause?.message || error.message) : null,
     };
     ev.narration = narrate ? narrate({ ev, res, parsed, resHeaders }) : defaultNarration(ev);
-    ev.outcome = error ? 'error' : res.status < 300 ? 'ok' : res.status === 401 || res.status === 403 || res.status === 400 ? 'denied' : 'error';
+    if (verdictOf && !error) ev.verdict = verdictOf({ ev, res, parsed });
+    ev.outcome = error ? 'error' : outcomeOf ? outcomeOf({ ev, parsed }) : res.status < 300 ? 'ok' : res.status === 401 || res.status === 403 || res.status === 400 ? 'denied' : 'error';
     await emit(sid, ev);
     return { res, parsed, resHeaders, ev };
   }
@@ -229,7 +240,7 @@ export function createApp(config) {
       else {
         const r = tenantNameFrom(req, resolution);
         if (r.invalid) return res.status(400).json({ error: 'Invalid demo name' });
-        name = r.name || (resolution.strategy === 'query' && req.session.tenant) || 'default';
+        name = r.name || (resolution.strategy === 'query' && req.session.tenant) || (personaMap.size && req.session.persona) || 'default';
       }
       const tenant = await getTenant(name);
       if (!tenant) return res.status(404).json({ error: 'Unknown demo' });
@@ -252,8 +263,19 @@ export function createApp(config) {
     const t = req.session.tokens;
     res.json({
       gatewayUrl: req.tenant.gatewayUrl,
+      personas: [...personaMap.values()].map(publicPersona), persona: req.session.persona || null,
       discovered: !!req.session.discovered && !!disc(req).asMeta, signedIn: !!t, tokenInfo: t ? tokenInfo(t) : null, mcpSessionId: req.session.mcpSessionId || null,
     });
+  });
+  // Choosing a persona (or null to go back to the picker) always starts that persona from a clean slate.
+  app.post('/api/persona', async (req, res) => {
+    const key = req.body?.key ?? null;
+    if (key !== null && !(personaMap.get(key)?.configured)) return res.status(400).json({ error: 'That persona is not set up' });
+    await resetAuth(req);
+    await store.clear(req.sessionID); // event numbers keep rising, so the page can tell new events from old ones
+    req.session.persona = key;
+    // head: where this session's event numbering is now. The page resumes from it, so a server restart (which restarts the numbering) cannot leave an open page ignoring new events.
+    res.json({ ok: true, persona: key, head: await store.head(req.sessionID) });
   });
   function tokenInfo(t) {
     const d = decodeJwt(t.access_token);
@@ -303,10 +325,11 @@ export function createApp(config) {
   app.post('/api/page-load', wrap(async (req, res) => {
     const returned = !!req.session.returnedFromOkta;
     req.session.returnedFromOkta = false;
-    if (!returned) { req.session.discovered = false; req.session.flow = null; await store.drop('sts:' + req.sessionID); }
+    // A plain load is a fresh start, which for personas means back to the picker.
+    if (!returned) { req.session.discovered = false; req.session.flow = null; req.session.persona = null; await store.drop('sts:' + req.sessionID); }
     res.json({ returned });
   }));
-  app.post('/api/events/clear', wrap(async (req, res) => { await store.clear(req.sessionID); res.json({ ok: true }); }));
+  app.post('/api/events/clear', wrap(async (req, res) => { await store.clear(req.sessionID); res.json({ ok: true, head: await store.head(req.sessionID) }); }));
 
   // Step 1: discovery. First poke the gateway with no credentials, then follow what it tells us.
   app.post('/api/discover', async (req, res) => {
@@ -368,11 +391,56 @@ export function createApp(config) {
     const u = new URL(asMeta.authorization_endpoint);
     Object.entries({ client_id: req.tenant.clientId, response_type: 'code', redirect_uri: req.tenant.redirectUri, scope, state, code_challenge: challenge, code_challenge_method: 'S256', resource: req.tenant.gatewayUrl })
       .forEach(([k, v]) => u.searchParams.set(k, v));
+    // login_hint pre-fills the persona's username; prompt=login forces a fresh sign-in so the previous persona's Okta session is not reused.
+    if (req.tenant.persona) { u.searchParams.set('login_hint', req.tenant.persona.login); u.searchParams.set('prompt', 'login'); }
     await emit(req.sessionID, {
       step: 'login', node: 'pkce', label: 'Send the user to Okta to sign in', method: 'GET (browser redirect)', url: u.toString().replace(/code_challenge=[^&]+/, 'code_challenge=' + mask(challenge)),
       request: { headers: {}, body: { response_type: 'code', scope, code_challenge_method: 'S256', code_challenge: mask(challenge), state: mask(state), resource: req.tenant.gatewayUrl } },
       response: null, ms: 0, outcome: 'ok',
       narration: `The app generated a random PKCE secret and sent only its SHA-256 hash (the challenge) to Okta. Anyone who intercepts the redirect cannot redeem the code without the original secret. The resource parameter pins the resulting token to this specific gateway, and scopes are ${scope}.`,
+    });
+    res.redirect(u.toString());
+  });
+
+  // "Try another team's agent": the signed-in persona asks Okta to sign them in to a DIFFERENT persona's agent. Nothing from the
+  // result is ever exchanged or kept, so the persona's own session is untouched. Okta's answer is the evidence.
+  const otherAgents = new Map(); // persona key -> what we learned about that agent's gateway and authorization server
+  async function lookupAgent(req, p) {
+    if (otherAgents.has(p.key)) return otherAgents.get(p.key);
+    const gw = new URL(p.gatewayUrl);
+    const prUrl = `${gw.origin}/.well-known/oauth-protected-resource${gw.pathname}`;
+    if (!safeUrl(prUrl, { allowLocal })) return null;
+    const pr = await traced({ sid: req.sessionID, step: 'login', label: `Look up the ${p.agent}’s gateway`, url: prUrl,
+      narrate: ({ ev, parsed }) => ev.error ? `Lookup failed: ${ev.error}.` : ev.response.status !== 200 ? `Returned ${ev.response.status}.` : `The ${p.gatewayLabel} gateway names its own authorization server, ${parsed.authorization_servers?.[0]}. Each team’s gateway has a separate one.` });
+    const asBase = pr.parsed?.authorization_servers?.[0];
+    const asUrl = asBase && safeUrl(asBase, { allowLocal });
+    if (!asUrl || (!allowLocal && asUrl.origin !== new URL(req.tenant.orgUrl).origin)) return null;
+    const as = await traced({ sid: req.sessionID, step: 'login', label: `Look up the ${p.agent}’s authorization server`, url: `${asBase}/.well-known/oauth-authorization-server`,
+      narrate: ({ ev, parsed }) => ev.error ? `Lookup failed: ${ev.error}.` : ev.response.status !== 200 ? `Returned ${ev.response.status}.` : `Its sign-in endpoint is ${new URL(parsed.authorization_endpoint).pathname}.` });
+    const ep = as.parsed?.authorization_endpoint;
+    const epUrl = ep && safeUrl(ep, { allowLocal });
+    if (!epUrl || epUrl.origin !== asUrl.origin) return null;
+    const found = { authorizeUrl: ep, scopes: (pr.parsed.scopes_supported || ['openid']).join(' ') };
+    otherAgents.set(p.key, found);
+    return found;
+  }
+  app.get('/auth/probe/:key', async (req, res) => {
+    const me = req.tenant.persona, other = personaMap.get(req.params.key);
+    if (!me || !req.session.tokens || !other?.configured || other.key === me.key) return res.status(400).send('Sign in as a persona first, and pick a different team’s agent.');
+    const found = await lookupAgent(req, other);
+    if (!found) return res.status(502).send('Could not look up that agent’s sign-in details.');
+    const verifier = crypto.randomBytes(48).toString('base64url');
+    const challenge = crypto.createHash('sha256').update(verifier).digest('base64url');
+    const state = crypto.randomBytes(16).toString('hex');
+    const redirectUri = `${req.tenant.origin}${other.callbackPath}`;
+    req.session.pkce = { verifier, state, redirectUri, probe: other.key };
+    const u = new URL(found.authorizeUrl);
+    Object.entries({ client_id: other.clientId, response_type: 'code', redirect_uri: redirectUri, scope: found.scopes, state, code_challenge: challenge, code_challenge_method: 'S256', resource: other.gatewayUrl })
+      .forEach(([k, v]) => u.searchParams.set(k, v));
+    await emit(req.sessionID, {
+      step: 'login', label: `${me.name} tries to sign in to the ${other.agent}`, method: 'GET (browser redirect)', url: u.toString().replace(/code_challenge=[^&]+/, 'code_challenge=' + mask(challenge)),
+      request: { headers: {}, body: { client_id: other.clientId, resource: other.gatewayUrl, note: 'No login hint and no forced login: Okta already knows who this is.' } }, response: null, ms: 0, outcome: 'ok',
+      narration: `${me.name} is signed in as a ${me.department} user. This asks Okta to sign the same person in to the ${other.agent}, which belongs to a different team. Okta checks whether the ${other.agent}’s app is assigned to ${me.name}. Nothing from the answer is kept or exchanged.`,
     });
     res.redirect(u.toString());
   });
@@ -383,6 +451,13 @@ export function createApp(config) {
     req.session.discovered = true;
     const saved = req.session.pkce;
     const { asMeta } = disc(req);
+    const probed = saved?.probe ? personaMap.get(saved.probe) : null;
+    if (error && probed) {
+      req.session.pkce = null;
+      await emit(req.sessionID, { step: 'login', label: `Okta refused ${req.tenant.persona?.name} access to the ${probed.agent}`, method: 'GET', url: redactUrl(req.originalUrl), request: { headers: {} }, response: { status: 400, body: { error, error_description } }, ms: 0, outcome: 'denied', verdict: probeVerdict({ person: req.tenant.persona?.name, agent: probed.agent, refused: true, target: { agent: probed.agent, gateway: probed.gatewayLabel, resource: probed.resourceLabel } }),
+        narration: `Okta turned the sign-in away before issuing anything: ${error}${error_description ? ` (“${error_description}”)` : ''}. ${req.tenant.persona?.name} is not assigned to the ${probed.agent}, so they cannot use another team’s agent, whatever that agent’s gateway holds. This is the first line of defence.` });
+      return res.redirect('/');
+    }
     if (error) {
       await emit(req.sessionID, { step: 'login', label: 'Okta returned an error', method: 'GET', url: redactUrl(req.originalUrl), request: { headers: {} }, response: { status: 400, body: { error, error_description } }, ms: 0, outcome: 'denied', narration: `Okta refused the sign-in: ${error}${error_description ? ` — ${error_description}` : ''}. Nothing was issued.` });
       return res.redirect('/');
@@ -393,6 +468,12 @@ export function createApp(config) {
       await emit(req.sessionID, { step: 'login', label: 'State mismatch', method: 'GET', url: redactUrl(req.originalUrl), request: { headers: {} }, response: { status: 400 }, ms: 0, outcome: 'denied', narration: 'The state value that came back did not match the one we sent. This is the CSRF check, so the response was discarded.' });
       return res.redirect('/');
     }
+    if (saved.probe) {
+      req.session.pkce = null;
+      await emit(req.sessionID, { step: 'login', label: `Okta issued a code for the ${probed?.agent || 'other agent'}`, method: 'GET', url: redactUrl(req.originalUrl), request: { headers: {} }, response: { status: 200, body: { code: mask(code) } }, ms: 0, outcome: 'error', verdict: probeVerdict({ person: req.tenant.persona?.name, agent: probed?.agent || 'other agent', refused: false }),
+        narration: `Unexpected: Okta let ${req.tenant.persona?.name} sign in to another team’s agent. The code was discarded. Check who the ${probed?.agent || 'other agent'}’s app is assigned to.` });
+      return res.redirect('/');
+    }
     F(req).code = code;
     await emit(req.sessionID, {
       step: 'login', node: 'code', label: 'Okta sent the user back with an authorization code', method: 'GET (browser redirect)', url: `${req.tenant.origin}${req.path}`,
@@ -401,7 +482,7 @@ export function createApp(config) {
     });
     const { res: r, parsed } = await traced({
       sid: req.sessionID, step: 'login', node: 'access', label: 'Trade the authorization code for an access token', method: 'POST', url: asMeta.token_endpoint,
-      form: { grant_type: 'authorization_code', code, redirect_uri: saved.redirectUri, client_id: req.tenant.clientId, client_secret: req.tenant.clientSecret, code_verifier: saved.verifier },
+      form: { grant_type: 'authorization_code', code, redirect_uri: saved.redirectUri, client_id: req.tenant.clientId, ...(req.tenant.clientSecret ? { client_secret: req.tenant.clientSecret } : {}), code_verifier: saved.verifier },
       narrate: ({ ev, parsed }) => {
         if (ev.error) return `Token endpoint unreachable: ${ev.error}.`;
         if (ev.response.status !== 200) return `Okta rejected the code exchange (${parsed?.error || ev.response.status}${parsed?.error_description ? ': ' + parsed.error_description : ''}).`;
@@ -425,14 +506,14 @@ export function createApp(config) {
 
   // Step 3: MCP over the gateway
   let rpcId = 10;
-  async function mcp(req, method, params, label, narrate, node = 'gateway') {
+  async function mcp(req, method, params, label, narrate, node = 'gateway', opts = {}) {
     const t = req.session.tokens;
     if (!t) return { status: 401, body: { error: 'Not signed in' } };
     const headers = { Authorization: `Bearer ${t.access_token}`, Accept: 'application/json, text/event-stream', 'MCP-Protocol-Version': '2025-06-18' };
     if (req.session.mcpSessionId) headers['Mcp-Session-Id'] = req.session.mcpSessionId;
     const body = method.startsWith('notifications/') ? { jsonrpc: '2.0', method, params } : { jsonrpc: '2.0', id: ++rpcId, method, params };
     const startedAt = Date.now();
-    const r = await traced({ sid: req.sessionID, step: 'mcp', node, label, method: 'POST', url: req.tenant.gatewayUrl, headers, body, narrate });
+    const r = await traced({ sid: req.sessionID, step: 'mcp', node, label, method: 'POST', url: req.tenant.gatewayUrl, headers, body, narrate, outcomeOf: opts.outcomeOf, verdictOf: opts.verdictOf });
     const sid = r.resHeaders['mcp-session-id'];
     if (sid) req.session.mcpSessionId = sid;
     if (!method.startsWith('notifications/')) {
@@ -441,15 +522,14 @@ export function createApp(config) {
       const rec = { at: startedAt, mcp: method, tool: params?.name, status, ms: r.ev.ms, rpcError: pb?.error?.message || null, consentUrl,
         toolCount: pb?.result?.tools?.length, ok: status === 200 && !pb?.error && !pb?.result?.isError, mcpSessionId: sid || req.session.mcpSessionId || null,
         authorization: redactHeaders({ authorization: headers.Authorization }).authorization };
+      if (opts.blocked) rec.blocked = true;
+      if (method === 'tools/list' && Array.isArray(pb?.result?.tools)) req.session.exposedTools = pb.result.tools.map((t) => t.name);
       F(req).gateway.calls.push(rec);
       if (method === 'tools/call') F(req).toolCalls.push(rec);
-      if (method === 'tools/call' && status === 200) defer(collectSts(req, startedAt, params?.name)); // runs after the response: the log lags a couple of seconds
+      if (method === 'tools/call' && status === 200 && !opts.blocked && !consentUrl) defer(collectSts(req, startedAt, params?.name)); // runs after the response: the log lags a couple of seconds
     }
     return { status: r.res?.status ?? 502, body: r.parsed, error: r.ev.error };
   }
-
-  // Finds an Okta consent / interaction URL anywhere in a response.
-  const findConsentUrl = (b) => JSON.stringify(b || {}).match(/https?:\/\/[^"\\\s]+(?:consent|interaction|authorize)[^"\\\s]*/i)?.[0] || null;
 
   app.post('/api/mcp/initialize', async (req, res) => {
     const r = await mcp(req, 'initialize', { protocolVersion: '2025-06-18', capabilities: {}, clientInfo: { name: 'agent-gateway-demo', version: '1.0.0' } }, 'Open an MCP session through the gateway',
@@ -488,13 +568,44 @@ export function createApp(config) {
       ({ ev, parsed }) => {
         if (ev.error) return `Gateway unreachable: ${ev.error}.`;
         if (ev.response.status !== 200) return `tools/call failed with ${ev.response.status}: ${JSON.stringify(parsed).slice(0, 220)}`;
-        if (parsed?.error) return findConsentUrl(parsed) ? 'Okta needs the user to authorize GitHub access first. A consent link was returned.' : `MCP error ${parsed.error.code}: ${parsed.error.message}.`;
+        if (findConsentUrl(parsed)) return 'The gateway could not call the downstream service yet: Okta needs this user to consent once, and returned a link. Open it, approve, then run the tool again. Okta stores the result, so this is a one-time step per user.';
+        if (parsed?.error) return `MCP error ${parsed.error.code}: ${parsed.error.message}.`;
         const isErr = parsed?.result?.isError;
-        return `The gateway forwarded ${name} to GitHub using a downstream token the agent never saw, and relayed the result${isErr ? ' (GitHub reported a tool-level error)' : ''}. ${ev.ms} ms round trip including the token exchange.`;
-      }, 'toolcall');
+        return `The gateway forwarded ${name} to the downstream service using a token the agent never saw, and relayed the result${isErr ? ' (the service reported a tool-level error)' : ''}. ${ev.ms} ms round trip including the token exchange.`;
+      }, 'toolcall', {
+        verdictOf: ({ ev, parsed }) => callVerdict({ name, status: ev.response?.status, error: ev.error, parsed, consentUrl: findConsentUrl(parsed) }),
+        // Needing consent or being refused is amber, a real failure is red, and only a normal result is green.
+        outcomeOf: ({ ev, parsed }) => ({ consent: 'denied', waking: 'denied', 'blocked-server': 'denied', problem: 'error' }[callVerdict({ name, status: ev.response?.status, error: ev.error, parsed, consentUrl: findConsentUrl(parsed) }).kind] || (ev.response.status < 300 ? 'ok' : 'error')),
+      });
     res.status(r.status).json({ ...r.body, consentUrl: findConsentUrl(r.body) });
   });
 
+  // Governance check: ask the gateway for a real tool its admin did not expose (another team's tool, or a GitHub write).
+  // Only the names listed for personas are allowed, and the call is refused unless the gateway's own tools/list (remembered from this
+  // session) shows the tool is NOT exposed, so this can never run anything. Arguments are empty on purpose.
+  const blockable = new Set(['GitHubMCP_merge_pull_request', 'GitHubMCP_delete_file', ...(config.personas || []).flatMap((p) => p.blockedTools.map((t) => t.name))]);
+  app.post('/api/mcp/blocked', async (req, res) => {
+    const name = req.body?.tool;
+    if (!blockable.has(name)) return res.status(400).json({ error: 'Unknown governance check' });
+    const exposed = req.session.exposedTools;
+    if (!exposed) return res.status(409).json({ error: 'List the gateway’s tools first.' });
+    if (exposed.includes(name)) return res.status(409).json({ error: `${name} is exposed on this gateway, so it is not a valid denial test.` });
+    const startedAt = Date.now();
+    const refused = (parsed) => !!(parsed?.error || parsed?.result?.isError);
+    const r = await mcp(req, 'tools/call', { name, arguments: {} }, `Call “${name}”, which the admin did not expose`,
+      ({ ev, parsed }) => {
+        if (ev.error) return `Gateway unreachable: ${ev.error}.`;
+        const s = ev.response.status;
+        const text = parsed?.error?.message || (parsed?.result?.content || []).map((c) => c.text).filter(Boolean).join(' ') || (typeof parsed === 'string' ? parsed : '');
+        const list = `${name} is not among the ${exposed.length} tool${exposed.length === 1 ? '' : 's'} the gateway listed for this agent`;
+        if (s >= 400) return `The gateway refused the call outright (HTTP ${s}${text ? `: ${String(text).slice(0, 160)}` : ''}). ${list}. The next card shows what Okta’s own log recorded.`;
+        if (refused(parsed)) return `The gateway did not run it. It answered${parsed?.error ? ` with MCP error ${parsed.error.code}${parsed.error.message ? ` (“${String(parsed.error.message).slice(0, 80)}”)` : ''}` : text ? `: ${String(text).slice(0, 160)}` : ''}. ${list}. The next card shows what Okta’s own log recorded, including why.`;
+        return `Unexpected: the gateway did not refuse ${name}. Check which tools are exposed on the virtual MCP server.`;
+      }, 'gateway', { blocked: true, verdictOf: ({ ev, parsed }) => blockedVerdict({ name, gatewayLabel: req.tenant.persona?.gatewayLabel, refused: ev.response.status >= 400 || refused(parsed) }), outcomeOf: ({ ev, parsed }) => (ev.response.status >= 400 || refused(parsed) ? 'denied' : 'error') });
+    console.log(`[blocked-call] ${name} -> HTTP ${r.status} ${JSON.stringify(r.body?.error || r.body?.result?.content || r.body || '').slice(0, 300)}`);
+    if (r.status < 500) defer(collectBlocked(req, startedAt, name));
+    res.status(r.status).json({ ...r.body, tool: name });
+  });
 
   // ---------- token flow (DAG) ----------
   // The downstream GitHub token is minted and held inside Okta, so nobody outside it can see it. What we can show
@@ -545,9 +656,48 @@ export function createApp(config) {
         request: { headers: redactHeaders(hdr), body: { since: new Date(sinceMs - 5000).toISOString(), filter: 'token exchange + agent_gateway events' } },
         response: { status: 200, body: { exchange, mostRecentExchange: latest, gatewayEvents: gw, githubConsentOnFile: consent } },
         ms: Date.now() - started, outcome: exchange && exchange.result !== 'SUCCESS' ? 'error' : 'ok', narration,
+        evidence: exchange ? `Okta’s log: token exchange ${exchange.result}${exchange.responseTimeMs ? ` in ${exchange.responseTimeMs} ms` : ''}` : latest ? 'Okta’s log: an earlier downstream token was reused' : undefined,
       });
     } catch (e) {
       await emit(sid, { step: 'mcp', node: 'sts', label: 'Okta System Log lookup failed', method: 'GET', url: `${req.tenant.orgUrl}/api/v1/logs`, request: { headers: redactHeaders(hdr) }, response: null, ms: Date.now() - started, error: String(e.message || e), outcome: 'error', narration: `Could not read Okta’s System Log: ${e.message}. The exchange still happened; only the evidence is missing.` });
+    }
+  }
+
+  // What Okta's own log says about a denied call: did it reach the token exchange? Reports facts only.
+  async function collectBlocked(req, sinceMs, tool) {
+    if (!req.tenant.logToken) return;
+    const sid = req.sessionID;
+    const idc = req.session.tokens?.id_token ? decodeJwt(req.session.tokens.id_token)?.claims : null;
+    const ac = decodeJwt(req.session.tokens?.access_token)?.claims;
+    const hdr = { Authorization: `SSWS ${req.tenant.logToken}`, Accept: 'application/json' };
+    const q = `${req.tenant.orgUrl}/api/v1/logs?${new URLSearchParams({ limit: '50', since: new Date(sinceMs - 3000).toISOString(), sortOrder: 'ASCENDING', filter: `eventType sw "${STS_EVENT}" or eventType sw "agent_gateway.mcp"` })}`;
+    const started = Date.now();
+    try {
+      let win = [];
+      // Denied calls reach the log more slowly than successful ones (around 15 s was seen), so wait longer.
+      for (let i = 0; i < 8; i++) {
+        await sleep(i === 0 ? 3000 : 3000);
+        const j = await fetch(q, { headers: hdr, signal: AbortSignal.timeout(20000) }).then((r) => r.json());
+        if (!Array.isArray(j)) throw new Error(j?.errorSummary || 'unexpected System Log response');
+        win = j.map(summarizeLog);
+        if (win.some((e) => e.eventType === 'agent_gateway.mcp.tool.call' && String(e.reason || '').includes(tool))) break;
+      }
+      const gw = win.filter((e) => e.eventType.startsWith('agent_gateway.'));
+      const calls = gw.filter((e) => e.eventType === 'agent_gateway.mcp.tool.call' && String(e.reason || '').includes(tool));
+      const exchanges = win.filter((e) => e.eventType === STS_EVENT && isMine(e, ac, idc));
+      const t = (iso) => new Date(iso).toLocaleTimeString();
+      const last = calls[calls.length - 1];
+      const callLine = last ? `Okta’s own log recorded the gateway’s tool.call event at ${t(last.at)} with result ${last.result}${last.reason ? `, reason: ${last.reason}` : ''}.` : 'Okta’s log has not yet shown a tool.call event for this attempt (denied calls can take 15 seconds or more to appear).';
+      const stsLine = exchanges.length ? `It also shows ${exchanges.length} token exchange${exchanges.length === 1 ? '' : 's'} for you in that window, so Okta did go to the token exchange.` : (last ? 'It shows no token exchange for you in that window, so the gateway stopped the call before any GitHub token was requested.' : 'It shows no token exchange for you in that window so far.');
+      await emit(sid, {
+        step: 'mcp', node: 'gateway', label: 'Okta System Log: what Okta recorded for the blocked call', method: 'GET', url: `${req.tenant.orgUrl}/api/v1/logs`,
+        request: { headers: redactHeaders(hdr), body: { since: new Date(sinceMs - 3000).toISOString(), filter: 'token exchange + agent_gateway events', tool } },
+        response: { status: 200, body: { gatewayEvents: gw, tokenExchangesForThisUser: exchanges } },
+        ms: Date.now() - started, outcome: 'ok', narration: `${callLine} ${stsLine}`,
+        evidence: last ? `Okta’s log: ${last.result}${last.reason ? ` (${last.reason})` : ''}${exchanges.length ? '' : '; no token exchange'}` : undefined,
+      });
+    } catch (e) {
+      await emit(sid, { step: 'mcp', node: 'gateway', label: 'Okta System Log lookup failed', method: 'GET', url: `${req.tenant.orgUrl}/api/v1/logs`, request: { headers: redactHeaders(hdr) }, response: null, ms: Date.now() - started, error: String(e.message || e), outcome: 'error', narration: `Could not read Okta’s System Log: ${e.message}.` });
     }
   }
 
@@ -571,11 +721,13 @@ export function createApp(config) {
       code: { status: fl.code ? 'done' : 'idle', data: fl.code ? { authorization_code: fl.code, single_use: true, redirect_uri: pk?.redirectUri || req.tenant.redirectUri } : null },
       access: { status: t ? 'done' : fl.tokenError ? 'error' : 'idle', data: t ? { access_token: t.access_token, token_type: t.token_type, scope: t.scope, expires_in: t.expires_in, refresh_token: t.refresh_token ? mask(t.refresh_token) : 'none issued', header: dec?.header, claims: dec?.claims, expiresAt: t.obtained_at + (t.expires_in || 0) * 1000 } : fl.tokenError || null },
       idtoken: { status: idDec ? 'done' : t ? 'skipped' : 'idle', data: idDec ? { id_token: t.id_token, header: idDec.header, claims: idDec.claims } : null },
-      gateway: { status: !g.length ? 'idle' : gOk ? 'done' : 'error', data: g.length ? { calls: g.slice(-8), audience_matches_gateway: dec?.claims?.aud === req.tenant.gatewayUrl, token_audience: dec?.claims?.aud, gateway: req.tenant.gatewayUrl } : null },
+      gateway: { status: !g.length ? 'idle' : last?.blocked ? 'error' : gOk ? 'done' : 'error', data: g.length ? { calls: g.slice(-8), audience_matches_gateway: dec?.claims?.aud === req.tenant.gatewayUrl, token_audience: dec?.claims?.aud, gateway: req.tenant.gatewayUrl } : null },
       sts: { status: stsS, data: stsS !== 'idle' ? { consentUrl, logAvailable: !!req.tenant.logToken, checkedAt: ev?.checkedAt, exchange: ev?.exchange || null, reused: !!ev?.reused, lastExchange: ev?.latest || null, consentOnFile: ev?.consent || null, oktaGatewayEvents: (ev?.window || []).filter((e) => e.eventType.startsWith('agent_gateway.')) } : null },
       ghtoken: { status: stsS === 'waiting' ? 'idle' : stsS, data: stsS !== 'idle' && stsS !== 'waiting' ? { visible: false, held_by: 'Okta. Never sent to this app or to the agent.', reused: !!ev?.reused, returned: ghRec ? { tokenTypes: ghRec.returnedTokenTypes, at: ghRec.at, responseTimeMs: ghRec.responseTimeMs, targetResourceOrn: ghRec.targetResourceOrn } : null, consentOnFile: ev?.consent ? { at: ev.consent.at, persistedTokenTypes: ev.consent.persistedTokenTypes } : null } : null },
-      toolcall: { status: callOk ? 'done' : (fl.toolCalls || []).length ? 'error' : 'idle', data: (fl.toolCalls || []).length ? { calls: fl.toolCalls.slice(-6) } : null },
+      toolcall: { status: callOk ? 'done' : consentUrl ? 'waiting' : (fl.toolCalls || []).length ? 'error' : 'idle', data: (fl.toolCalls || []).length ? { calls: fl.toolCalls.slice(-6) } : null },
     };
+    // The latest call was turned away at the gateway, so it never reached the token exchange, the GitHub token or the tool.
+    if (last?.blocked) for (const id of ['sts', 'ghtoken', 'toolcall']) nodes[id] = { status: 'idle', data: null };
     res.json({ nodes });
   });
 

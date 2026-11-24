@@ -44,6 +44,33 @@ npm start
 Open http://localhost:8080 and follow the steps. Sign in as a user assigned to the agent app (the demo owner is
 assigned automatically).
 
+## Three-team version: personas, gateways and real data
+
+The app can also show **who may reach what** across three teams. The home screen is an account chooser (Ethan in Engineering,
+Sofia in Sales, Hannah in HR). Each person signs in through **their own team's agent**, which reaches **their own team's gateway**:
+
+| Persona | Agent | Gateway | Behind it |
+|---|---|---|---|
+| Ethan Park (Engineering) | Engineering Agent | Engineering Tools | GitHub MCP server |
+| Sofia Reyes (Sales) | Sales Agent | Sales Tools | CRM MCP server (Aurora) |
+| Hannah Cho (HR) | HR Agent | HR Resources | HR MCP server (Aurora) |
+
+After signing in, each page answers the last thing you tried with a plain verdict (**Allowed**, **Blocked by Okta**, **Blocked
+by the gateway**, **One-time consent needed**), backed by Okta's own System Log. Two checks try to break it: sign the same
+person in to another team's agent (stopped by Okta), and ask for a tool their gateway does not list (stopped by the gateway).
+
+Set these in your shell or `.env` (the original `OKTA_ORG_URL`, `GATEWAY_URL`, `CLIENT_ID` still describe the Engineering persona):
+`SALES_AGENT_CLIENT_ID`, `SALES_AGENT_CLIENT_SECRET`, `HR_AGENT_CLIENT_ID`, `HR_AGENT_CLIENT_SECRET`. A persona whose settings are
+missing is shown as "not set up". Gateway paths are `sales-tools` and `hr-resources` on the same gateway host (see `personas.js`).
+
+`infra/` holds the two demo MCP servers (`infra/mcp/`, AWS Lambda behind API Gateway, no dependencies) and the fake CRM and HR
+data (`infra/db/`, Aurora PostgreSQL through the RDS Data API). Each server verifies the Okta access token and checks its scopes.
+Build the Lambda zip with `./infra/build.sh`; load data with `node infra/db/run-sql.mjs infra/db/01-schema.sql`. Aurora can
+pause when idle, so run `npm run warm` a few minutes before a session.
+
+To review the interface without signing in to anything: `node scripts/preview.mjs /tmp/preview` renders each state in
+headless Chrome against a fake backend and saves screenshots.
+
 ## Tests
 ```sh
 npm test

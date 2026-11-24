@@ -3,15 +3,18 @@
 import { createBootstrap, toTenant } from './bootstrap.js';
 import { createHooks } from './hooks.js';
 import { createMemoryStore, createRedisStore } from './store.js';
+import { personasFromEnv } from './personas.js';
 
 const LOCAL_HOSTS = ['localhost', '127.0.0.1'];
 
 export function configFromEnv(env, { store, defer, redisFactory, log = console.log } = {}) {
-  const { OKTA_ORG_URL, GATEWAY_URL, CLIENT_ID, CLIENT_SECRET, PORT = 8080, DEMO_API_APP_ID, DEMO_API_CLIENT_ID, DEMO_API_CLIENT_SECRET } = env;
+  const { OKTA_ORG_URL, GATEWAY_URL, CLIENT_ID, CLIENT_SECRET, CALLBACK_PATH, PORT = 8080, DEMO_API_APP_ID, DEMO_API_CLIENT_ID, DEMO_API_CLIENT_SECRET } = env;
   // Multi-tenant mode (hosted on the demo platform) is on when the Bootstrap credentials are present; otherwise the one
   // org in the environment is served, exactly as before.
   const multi = !!DEMO_API_APP_ID;
-  const need = multi ? { DEMO_API_APP_ID, DEMO_API_CLIENT_ID, DEMO_API_CLIENT_SECRET, BASE_URI: env.BASE_URI } : { OKTA_ORG_URL, GATEWAY_URL, CLIENT_ID, CLIENT_SECRET };
+  // A client whose ID is a URL (Client ID Metadata Document, e.g. Claude Code's) is a public client: PKCE only, no secret.
+  const publicClient = /^https:\/\//.test(CLIENT_ID || '');
+  const need = multi ? { DEMO_API_APP_ID, DEMO_API_CLIENT_ID, DEMO_API_CLIENT_SECRET, BASE_URI: env.BASE_URI } : { OKTA_ORG_URL, GATEWAY_URL, CLIENT_ID, ...(publicClient ? {} : { CLIENT_SECRET }) };
   for (const [k, v] of Object.entries(need)) if (!v) throw new Error(`Missing ${k}. Copy .env.example to .env and fill it in (see README.md)`);
 
   // The public address of this app. It is never taken from request headers, because Okta needs the exact value
@@ -52,7 +55,9 @@ export function configFromEnv(env, { store, defer, redisFactory, log = console.l
     ...multiConfig, origin, allowLocal: local, store: chosenStore, defer, port: PORT,
     transport: serverless || env.EVENT_TRANSPORT === 'poll' ? 'poll' : 'stream',
     sessionSecret: env.SESSION_SECRET, trustProxy: tp ? (/^\d+$/.test(tp) ? Number(tp) : tp) : undefined,
-    orgUrl: OKTA_ORG_URL, gatewayUrl: GATEWAY_URL, clientId: CLIENT_ID, clientSecret: CLIENT_SECRET,
+    // The persona picker only applies to the single-org setup; the hosted multi-tenant mode serves one demo per tenant.
+    personas: multi ? [] : personasFromEnv(env),
+    orgUrl: OKTA_ORG_URL, gatewayUrl: GATEWAY_URL, clientId: CLIENT_ID, clientSecret: CLIENT_SECRET || undefined, callbackPath: CALLBACK_PATH,
     // Reading the System Log needs an admin token, so it is only offered for the single configured org.
     logToken: multi ? undefined : env.OKTA_API_TOKEN,
   };

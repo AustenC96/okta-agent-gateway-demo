@@ -1,0 +1,155 @@
+// Dev tool: renders the REAL page (public/) in headless Chrome against a FAKE backend and saves screenshots of each state,
+// so the interface can be reviewed without signing in to Okta. Nothing here talks to Okta or AWS.
+//   1. npm start                      (any config: only the static files are used)
+//   2. node scripts/preview.mjs [outDir] [scenario...]     e.g. node scripts/preview.mjs /tmp/preview allowed blocked
+import { spawn } from 'node:child_process';
+import { mkdirSync, writeFileSync } from 'node:fs';
+
+const BASE = process.env.PREVIEW_BASE || 'http://localhost:8080';
+const CHROME = process.env.CHROME || '/Applications/Google Chrome.app/Contents/MacOS/Google Chrome';
+const PORT = 9333, OUT = process.argv[2] || '/tmp/preview';
+const WANT = process.argv.slice(3);
+const SIZE = { width: Number(process.env.W) || 1600, height: Number(process.env.H) || 1000 };
+mkdirSync(OUT, { recursive: true });
+const sleep = (ms) => new Promise((r) => setTimeout(r, ms));
+
+// ---------- the fake backend ----------
+const T = (name, description, ro = true) => ({ name, description, inputSchema: { type: 'object', properties: {} }, annotations: { readOnlyHint: ro } });
+const PERSONAS = [
+  { key: 'ethan', name: 'Ethan Park', department: 'Engineering', agent: 'Engineering Agent', gatewayLabel: 'Engineering Tools', resourceLabel: 'GitHub', gatewayPath: '/mcp/servers/agent-gateway-agent-gateway', configured: true,
+    blockedTools: [{ name: 'GitHubMCP_merge_pull_request', label: 'merge_pull_request (GitHub write)' }, { name: 'GitHubMCP_delete_file', label: 'delete_file (GitHub write)' }, { name: 'CRMMCP_list_deals', label: 'list_deals (Sales CRM)' }, { name: 'HRMCP_get_compensation', label: 'get_compensation (HR)' }],
+    tools: [T('GitHubMCP_get_me', 'Get the authenticated user'), T('GitHubMCP_search_repositories', 'Find repositories'), T('GitHubMCP_get_file_contents', 'Read a file')] },
+  { key: 'sofia', name: 'Sofia Reyes', department: 'Sales', agent: 'Sales Agent', gatewayLabel: 'Sales Tools', resourceLabel: 'CRM data', gatewayPath: '/mcp/servers/sales-tools', configured: true,
+    blockedTools: [{ name: 'HRMCP_get_compensation', label: 'get_compensation (HR)' }, { name: 'GitHubMCP_get_me', label: 'get_me (GitHub)' }],
+    tools: [T('CRMMCP_search_customers', 'Search customers'), T('CRMMCP_get_customer', 'Get one customer'), T('CRMMCP_list_deals', 'List deals'), T('CRMMCP_update_deal_stage', 'Move a deal', false)] },
+  { key: 'hannah', name: 'Hannah Cho', department: 'HR', agent: 'HR Agent', gatewayLabel: 'HR Resources', resourceLabel: 'HR data', gatewayPath: '/mcp/servers/hr-resources', configured: true,
+    blockedTools: [{ name: 'CRMMCP_update_deal_stage', label: 'update_deal_stage (Sales CRM write)' }, { name: 'GitHubMCP_get_me', label: 'get_me (GitHub)' }],
+    tools: [T('HRMCP_list_employees', 'List employees'), T('HRMCP_get_employee', 'Get an employee'), T('HRMCP_get_compensation', 'Get salary')] },
+];
+const RESULTS = {
+  CRMMCP_search_customers: [{ customer_id: 'C-1001', name: 'Northwind Logistics', industry: 'Logistics', tier: 'Enterprise', contact_name: 'Maria Lopez', account_owner: 'Sofia Reyes' }, { customer_id: 'C-1008', name: 'Proseware Financial', industry: 'Financial services', tier: 'Enterprise', contact_name: 'Daniel Osei', account_owner: 'Sofia Reyes' }, { customer_id: 'C-1004', name: 'Tailspin Aerospace', industry: 'Aerospace', tier: 'Enterprise', contact_name: 'Lukas Brandt', account_owner: 'Sofia Reyes' }],
+  CRMMCP_get_customer: [{ customer_id: 'C-1001', name: 'Northwind Logistics', industry: 'Logistics', tier: 'Enterprise', contact_name: 'Maria Lopez', contact_email: 'maria.lopez@northwind.example', account_owner: 'Sofia Reyes' }],
+  HRMCP_get_compensation: [{ employee_id: 'E-2005', name: 'Hannah Cho', department: 'HR', salary_usd: '98000.00' }],
+  GitHubMCP_get_me: { login: 'octocat-demo', name: 'Demo User', public_repos: 8, html_url: 'https://github.com/octocat-demo' },
+};
+let S, ID;
+const reset = (persona = null) => { S = { persona, discovered: false, signedIn: false, connected: false, last: null, events: [], flowBlocked: false, called: false, consent: false }; };
+reset();
+ID = 0;
+const ev = (e) => { const full = { id: ++ID, step: 'mcp', method: 'POST', ms: 120, outcome: 'ok', request: { headers: {}, body: {} }, response: { status: 200, body: {} }, ts: new Date().toISOString(), ...e }; S.events.push(full); return full; };
+const me = () => PERSONAS.find((p) => p.key === S.persona);
+const GW = (p) => `https://example-org.gateway.oktapreview.com${p.gatewayPath}`;
+function flowNodes() {
+  const d = (cond) => (cond ? 'done' : 'idle');
+  const t = S.called ? 'done' : S.consent ? 'waiting' : 'idle';
+  const gw = S.flowBlocked ? 'error' : d(S.connected);
+  const past = S.flowBlocked ? 'idle' : null;
+  return {
+    discover: { status: d(S.discovered), data: { resource: 'x' } }, pkce: { status: d(S.signedIn), data: {} }, code: { status: d(S.signedIn), data: {} },
+    access: { status: d(S.signedIn), data: { access_token: 'eyJraWQiOiJ4In0.eyJzdWIiOiJ1In0.sig', claims: { sub: 'user', aud: 'gateway' }, header: { alg: 'RS256' }, expiresAt: Date.now() + 3.6e6 } },
+    idtoken: { status: d(S.signedIn), data: { id_token: 'eyJ.x.y', claims: {} } }, gateway: { status: gw, data: { calls: [] } },
+    sts: { status: past || (S.called ? 'done' : S.consent ? 'waiting' : 'idle'), data: S.called ? { exchange: { result: 'SUCCESS', at: new Date().toISOString() }, oktaGatewayEvents: [{}] } : null },
+    ghtoken: { status: past || d(S.called), data: S.called ? { visible: false } : null }, toolcall: { status: past || t, data: { calls: [] } },
+  };
+}
+function route(method, path, body) {
+  const p = me();
+  if (path === '/api/transport') return { mode: 'poll' };
+  if (path === '/api/page-load') return { returned: true };
+  if (path === '/api/config') return { gatewayUrl: p ? GW(p) : GW(PERSONAS[0]), personas: PERSONAS.map(({ tools, ...x }) => x), persona: S.persona, discovered: S.discovered, signedIn: S.signedIn,
+    tokenInfo: S.signedIn ? { claims: { sub: p.name.toLowerCase().replace(' ', '.') + '@agentgateway.demo' }, expiresAt: Date.now() + 3.6e6 } : null };
+  if (path === '/api/persona') { reset(body.key); return { ok: true, persona: body.key }; }
+  if (path === '/api/events/clear') { S.events = []; return { ok: true }; }
+  if (path.startsWith('/api/events/poll')) { const after = Number(new URL('http://x' + path).searchParams.get('after') || 0); const init = path.includes('init=1'); return init ? { head: ID } : { events: S.events.filter((e) => e.id > after), head: ID }; }
+  if (path === '/api/flow') return { nodes: flowNodes() };
+  if (path === '/api/discover') {
+    S.discovered = true;
+    ev({ step: 'discover', node: 'discover', label: 'Knock on the gateway with no credentials', url: GW(p), response: { status: 401 }, outcome: 'ok', ms: 301, narration: 'The gateway answered 401 Unauthorized, which is what we want to see. It will not talk to anonymous callers. Its WWW-Authenticate header tells the client where to find its OAuth metadata. This is how any MCP client discovers how to sign in.' });
+    ev({ step: 'discover', node: 'discover', method: 'GET', label: 'Read the gateway’s protected-resource metadata', url: GW(p) + '/meta', ms: 211, narration: `The gateway says it is the protected resource “${p.gatewayPath}” and that tokens must come from its own Okta authorization server. The client now knows exactly who to ask for a token.` });
+    return { ok: true };
+  }
+  if (path === '/api/mcp/initialize') { S.connected = true; ev({ label: 'Open an MCP session through the gateway', url: GW(p), ms: 644, node: 'gateway', narration: `The gateway accepted our Okta token and answered as MCP server “${p.gatewayPath.split('/').pop()}”. It advertises capabilities: tools.` }); return { result: {} }; }
+  if (path === '/api/mcp/tools') { ev({ label: 'Ask the gateway which tools this agent may use', url: GW(p), ms: 160, node: 'gateway', narration: `The gateway returned ${p.tools.length} tools. These are the tools the admin chose to expose from the upstream server, not everything the service offers.` }); return { result: { tools: p.tools }, consentUrl: null }; }
+  if (path === '/api/mcp/call') {
+    if (S.consent) {
+      ev({ label: `Call tool “${body.name}”`, url: GW(p), ms: 1918, node: 'toolcall', narration: 'The gateway could not call the downstream service yet: Okta needs this user to consent once, and returned a link.', verdict: { kind: 'consent', title: 'One-time consent needed', detail: 'Okta must ask this user to approve access to the service once.', url: 'https://example-org.oktapreview.com/oauth2/v1/sts/redirect?dataHandle=x' } });
+      return { consentUrl: 'https://x' };
+    }
+    S.called = true; const r = RESULTS[body.name] ?? { ok: true };
+    ev({ label: `Call tool “${body.name}”`, url: GW(p), ms: 1342, node: 'toolcall', narration: 'The gateway forwarded the call to the downstream service using a token the agent never saw, and relayed the result. 1342 ms round trip including the token exchange.', response: { status: 200, body: { result: { content: [{ type: 'text', text: JSON.stringify(r, null, 2) }] } } }, verdict: { kind: 'allowed', title: 'Allowed', detail: `${body.name.replace(/^.*MCP_/, '').replace(/_/g, ' ')} ran through the gateway.` } });
+    setTimeout(() => ev({ step: 'mcp', node: 'sts', method: 'GET', label: 'Okta System Log: the token exchange behind that call', url: 'https://example-org.oktapreview.com/api/v1/logs', ms: 10859, narration: 'Okta’s System Log confirms the exchange (SUCCESS). The gateway, signing in as its own workload identity, presented the agent’s access token. Okta checked the delegation link and resource connection, then returned a downstream token in 212 ms.', evidence: 'Okta’s log: token exchange SUCCESS in 212 ms' }), 1500);
+    return { result: { content: [{ type: 'text', text: JSON.stringify(r) }] } };
+  }
+  if (path === '/api/mcp/blocked') {
+    S.flowBlocked = true;
+    ev({ label: `Call “${body.tool}”, which the admin did not expose`, url: GW(p), ms: 457, node: 'gateway', outcome: 'denied', narration: `The gateway did not run it. It answered with MCP error -32602 (“invalid params”). ${body.tool} is not among the ${p.tools.length} tools the gateway listed for this agent. The next card shows what Okta’s own log recorded, including why.`, verdict: { kind: 'blocked-gateway', title: 'Blocked by the gateway', detail: `${body.tool.replace(/^.*MCP_/, '').replace(/_/g, ' ')} is not one of the tools ${p.gatewayLabel} exposes.` } });
+    setTimeout(() => ev({ node: 'gateway', method: 'GET', label: 'Okta System Log: what Okta recorded for the blocked call', url: 'https://example-org.oktapreview.com/api/v1/logs', ms: 15210, narration: `Okta’s own log recorded the gateway’s tool.call event with result DENY, reason: tool "${body.tool}" not found. It shows no token exchange for you in that window, so the gateway stopped the call before any downstream token was requested.`, evidence: `Okta’s log: DENY (tool "${body.tool}" not found); no token exchange` }), 1500);
+    return { error: { code: -32602, message: 'invalid params' } };
+  }
+  return { error: 'not faked: ' + path };
+}
+
+// ---------- Chrome over the DevTools protocol ----------
+async function launch() {
+  const proc = spawn(CHROME, ['--headless=new', '--disable-gpu', '--hide-scrollbars', '--no-first-run', `--remote-debugging-port=${PORT}`, `--user-data-dir=/tmp/preview-profile-${Date.now()}`, '--allow-insecure-localhost', 'about:blank'], { stdio: 'ignore' });
+  for (let i = 0; i < 60; i++) { try { const r = await fetch(`http://127.0.0.1:${PORT}/json/list`); const l = await r.json(); const pg = l.find((t) => t.type === 'page'); if (pg) return { proc, ws: pg.webSocketDebuggerUrl }; } catch { /* not up yet */ } await sleep(250); }
+  throw new Error('Chrome did not start');
+}
+const { proc, ws: wsUrl } = await launch();
+const ws = new WebSocket(wsUrl);
+await new Promise((r) => (ws.onopen = r));
+let nextId = 0; const pending = new Map();
+const send = (method, params = {}) => new Promise((res, rej) => { const id = ++nextId; pending.set(id, { res, rej }); ws.send(JSON.stringify({ id, method, params })); });
+ws.onmessage = async (m) => {
+  const msg = JSON.parse(m.data);
+  if (msg.id && pending.has(msg.id)) { const { res, rej } = pending.get(msg.id); pending.delete(msg.id); msg.error ? rej(new Error(msg.error.message)) : res(msg.result); return; }
+  if (msg.method === 'Fetch.requestPaused') {
+    const { requestId, request } = msg.params; const u = new URL(request.url);
+    if (!u.pathname.startsWith('/api/')) return send('Fetch.continueRequest', { requestId });
+    let body = {}; try { body = JSON.parse(request.postData || '{}'); } catch { /* none */ }
+    const out = route(request.method, u.pathname + u.search, body);
+    return send('Fetch.fulfillRequest', { requestId, responseCode: 200, responseHeaders: [{ name: 'content-type', value: 'application/json' }, { name: 'cache-control', value: 'no-store' }], body: Buffer.from(JSON.stringify(out)).toString('base64') });
+  }
+};
+await send('Page.enable'); await send('Runtime.enable'); await send('Network.enable'); await send('Network.setCacheDisabled', { cacheDisabled: true });
+if (!process.env.REAL) await send('Fetch.enable', { patterns: [{ urlPattern: `${BASE}/*` }] }); // REAL=1 talks to the real server instead of the fake
+await send('Emulation.setDeviceMetricsOverride', { ...SIZE, deviceScaleFactor: 1, mobile: false });
+const ev$ = async (expression) => { const r = await send('Runtime.evaluate', { expression, awaitPromise: true, returnByValue: true }); if (r.exceptionDetails) throw new Error(r.exceptionDetails.exception?.description || r.exceptionDetails.text); return r.result.value; };
+const click = (sel, i = 0) => ev$(`(()=>{const e=document.querySelectorAll(${JSON.stringify(sel)})[${i}];if(!e)throw new Error('no element '+${JSON.stringify(sel)});e.click();return true})()`);
+const shot = async (name) => { await sleep(900); const { data } = await send('Page.captureScreenshot', { format: 'png' }); writeFileSync(`${OUT}/${name}.png`, Buffer.from(data, 'base64')); console.log('saved', `${OUT}/${name}.png`); };
+const open = async () => { await send('Page.navigate', { url: BASE + '/' }); await sleep(1200); };
+const choose = async (key) => { await click(`.personaCard[data-key="${key}"]`); await sleep(700); };
+const signIn = async () => { S.signedIn = true; await ev$('load()'); await sleep(500); };
+
+const ERRORS = [];
+ws.addEventListener('message', (m) => { const d = JSON.parse(m.data); if (d.method === 'Runtime.exceptionThrown') ERRORS.push(d.params.exceptionDetails.exception?.description?.split('\n')[0] || d.params.exceptionDetails.text); if (d.method === 'Runtime.consoleAPICalled' && d.params.type === 'error') ERRORS.push(d.params.args.map((x) => x.value || x.description).join(' ')); });
+const SCENARIOS = {
+  async picker() { reset(); await open(); await shot('01-picker'); },
+  async start() { reset(); await open(); await choose('sofia'); await shot('02-discover'); },
+  async tools() { reset(); await open(); await choose('sofia'); await click('#go'); await sleep(700); await signIn(); await click('#go'); await sleep(900); await shot('03-tools'); },
+  async allowed() { await SCENARIOS.tools(); await click('.tool button[data-i]', 0); await sleep(2800); await shot('04-allowed-table'); await click('.tool button[data-i]', 1); await sleep(2600); await shot('05-allowed-detail'); },
+  async blocked() { await SCENARIOS.tools(); await click('.govCard button[data-blocked]', 0); await sleep(2800); await shot('06-blocked-gateway'); },
+  async okta() { await SCENARIOS.tools(); ev({ step: 'login', label: 'Okta refused Sofia Reyes access to the Engineering Agent', method: 'GET', url: 'https://example-org.oktapreview.com/authorization-code/callback', ms: 0, outcome: 'denied', response: { status: 400 }, narration: 'Okta turned the sign-in away before issuing anything: access_denied (“User is not assigned to the client application.”). Sofia Reyes is not assigned to the Engineering Agent, so they cannot use another team’s agent, whatever that agent’s gateway holds. This is the first line of defence.', verdict: { kind: 'blocked-okta', title: 'Blocked by Okta', detail: 'Sofia Reyes is not assigned to the Engineering Agent.', target: { agent: 'Engineering Agent', gateway: 'Engineering Tools', resource: 'GitHub' } } }); await sleep(2500); await shot('07-blocked-okta'); },
+  async consent() { reset(); await open(); await choose('ethan'); S.consent = true; await click('#go'); await sleep(700); await signIn(); await click('#go'); await sleep(900); await click('.tool button[data-i]', 0); await sleep(2500); await shot('08-consent'); },
+  // REAL=1 only: drives the real server as far as it can go without a password (picker, choose, discover) and reports what the page shows.
+  async real() { await open(); await choose('sofia'); await click('#go'); await sleep(2500); console.log('trace cards on the page:', await ev$("document.querySelectorAll('#feed .ev').length"), '| count label:', await ev$("document.querySelector('#count').textContent"), '| console errors:', JSON.stringify(ERRORS)); await shot('10-real-discover'); },
+  // REAL=1 only: the bug where an open page kept a high event number from before a server restart and then ignored every new event.
+  async stale() {
+    await open(); await choose('sofia'); await click('#go'); await sleep(2000);
+    console.log('before:', await ev$("document.querySelectorAll('#feed .ev').length"), 'cards');
+    await ev$('lastId = 50'); // what a page open across a server restart looks like
+    await click('#switch'); await sleep(600); await choose('sofia'); await click('#go'); await sleep(2500);
+    console.log('after switching persona with a stale number:', await ev$("document.querySelectorAll('#feed .ev').length"), 'cards (3 expected)', '| lastId now', await ev$('lastId'));
+  },
+  // Stands in for the trip to Okta and back: leaving stores the tool list, returning restores it, so the page lands on step 4 and not on Connect.
+  async roundtrip() {
+    await SCENARIOS.tools();
+    await ev$("document.body.dispatchEvent(new Event('x')); (()=>{const a=document.createElement('a');a.href='/auth/probe/ethan';a.id='fakeProbe';a.onclick=(e)=>e.preventDefault();document.body.append(a);a.click();})()");
+    await open(); await sleep(800);
+    console.log('step after returning:', await ev$("document.querySelector('#steps li.active b').textContent"), '| tool tiles:', await ev$("document.querySelectorAll('.tool').length"));
+  },
+  async hood() { await SCENARIOS.allowed(); await click('#hood'); await sleep(800); await shot('09-under-the-hood'); },
+};
+try {
+  for (const name of (WANT.length ? WANT : Object.keys(SCENARIOS))) { console.log('scenario', name); await SCENARIOS[name](); }
+} finally { ws.close(); proc.kill(); }
