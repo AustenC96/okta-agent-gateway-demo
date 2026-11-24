@@ -5,7 +5,8 @@
   "type": "module",
   "scripts": {
     "start": "node server.js",
-    "test": "node --test \"test/*.test.js\""
+    "test": "node --test \"test/*.test.js\"",
+    "warm": "node scripts/warm-db.mjs"
   },
   "dependencies": {
     "@upstash/redis": "^1.39.0",
