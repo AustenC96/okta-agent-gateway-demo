@@ -13,7 +13,7 @@ the AI agent and the GitHub connection; this app is a front end that plays the a
 1. A demo org with the Agent Gateway component attached and working. Complete **Parts 1-4** of the
    *Demo Guide: Okta Agent Gateway* (GitHub App, API token, attach, GitHub consent, discover tools).
    You do not need Claude Code (Part 5) for this app.
-2. Node.js 18+.
+2. Node.js 20 or newer.
 
 ## Setup
 
@@ -43,6 +43,41 @@ npm start
 ```
 Open http://localhost:8080 and follow the steps. Sign in as a user assigned to the agent app (the demo owner is
 assigned automatically).
+
+## Three-team version: personas, gateways and real data
+
+The app can also show **who may reach what** across three teams. The home screen is an account chooser (Ethan in Engineering,
+Sofia in Sales, Hannah in HR). Each person signs in through **their own team's agent**, which reaches **their own team's gateway**:
+
+| Persona | Agent | Gateway | Behind it |
+|---|---|---|---|
+| Ethan Park (Engineering) | Engineering Agent | Engineering Tools | GitHub MCP server |
+| Sofia Reyes (Sales) | Sales Agent | Sales Tools | CRM MCP server (Aurora) |
+| Hannah Cho (HR) | HR Agent | HR Resources | HR MCP server (Aurora) |
+
+After signing in, each page answers the last thing you tried with a plain verdict (**Allowed**, **Blocked by Okta**, **Blocked
+by the gateway**, **One-time consent needed**), backed by Okta's own System Log. Two checks try to break it: sign the same
+person in to another team's agent (stopped by Okta), and ask for a tool their gateway does not list (stopped by the gateway).
+
+Set these in your shell or `.env` (the original `OKTA_ORG_URL`, `GATEWAY_URL`, `CLIENT_ID` still describe the Engineering persona):
+`SALES_AGENT_CLIENT_ID`, `SALES_AGENT_CLIENT_SECRET`, `HR_AGENT_CLIENT_ID`, `HR_AGENT_CLIENT_SECRET`. A persona whose settings are
+missing is shown as "not set up". Gateway paths are `sales-tools` and `hr-resources` on the same gateway host (see `personas.js`).
+
+`infra/` holds the two demo MCP servers (`infra/mcp/`, AWS Lambda behind API Gateway, no dependencies) and the fake CRM and HR
+data (`infra/db/`, Aurora PostgreSQL through the RDS Data API). Each server verifies the Okta access token and checks its scopes.
+Build the Lambda zip with `./infra/build.sh`; load data with `node infra/db/run-sql.mjs infra/db/01-schema.sql`. Aurora can
+pause when idle, so run `npm run warm` a few minutes before a session.
+
+To review the interface without signing in to anything: `node scripts/preview.mjs /tmp/preview` renders each state in
+headless Chrome against a fake backend and saves screenshots.
+
+## Tests
+```sh
+npm test
+```
+Runs without any Okta org or network access: it starts the app on a random port against local stub servers. It covers
+trace isolation between visitors, personas and their sign-in, the wrong-agent check, verdicts, redirect URI handling, the System
+Log user filter, URL safety checks, and the CRM and HR MCP servers (token checks, scopes, database wake-up).
 
 ## Notes and limits
 - The gateway and Virtual MCP APIs are Research Release (Beta) and may change.

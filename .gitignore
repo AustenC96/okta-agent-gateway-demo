@@ -1,2 +1,6 @@
 node_modules
 .env
+.vercel
+
+# Lambda build artifacts
+infra/*.zip
