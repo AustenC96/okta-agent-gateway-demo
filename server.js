@@ -557,6 +557,83 @@ export function createApp(config) {
     res.status(r.status).json({ ...r.body, consentUrl: findConsentUrl(r.body) });
   });
 
+  // Chat: the person's own Okta token goes to their team's agent on Amazon Bedrock AgentCore Runtime, which validates it against the
+  // team gateway's authorization server and forwards it, untouched, to the gateway. This app never sees or holds a model, a tool list, or any
+  // downstream token. The agent streams back text and tool events; each tool call is recorded in the timeline like any other call.
+  app.post('/api/chat', wrap(async (req, res) => {
+    const t = req.session.tokens, me = req.tenant.persona;
+    if (!t) return res.status(401).json({ error: 'Not signed in' });
+    if (!me?.agentArn) return res.status(400).json({ error: 'No agent runtime is configured for this person' });
+    const prompt = String(req.body?.prompt || '').trim().slice(0, 2000);
+    if (!prompt) return res.status(400).json({ error: 'Say something first' });
+    const region = me.agentArn.split(':')[3];
+    const url = `${me.agentEndpoint || `https://bedrock-agentcore.${region}.amazonaws.com`}/runtimes/${encodeURIComponent(me.agentArn)}/invocations?qualifier=DEFAULT`; // agentEndpoint exists for tests only
+    const agentSession = `agw-${req.sessionID.replace(/[^A-Za-z0-9]/g, '')}`.padEnd(40, '0').slice(0, 64); // AgentCore needs 33+ characters
+    const started = Date.now();
+    let up;
+    try {
+      up = await fetch(url, {
+        method: 'POST', signal: AbortSignal.timeout(120000),
+        headers: { Authorization: `Bearer ${t.access_token}`, 'Content-Type': 'application/json', Accept: 'text/event-stream', 'X-Amzn-Bedrock-AgentCore-Runtime-Session-Id': agentSession },
+        body: JSON.stringify({ prompt }),
+      });
+    } catch (e) { return res.status(502).json({ error: `The agent could not be reached: ${String(e.cause?.message || e.message)}` }); }
+    if (!up.ok || !up.body) {
+      const why = up.status === 401 || up.status === 403 ? 'AgentCore refused the token (expired, or issued for a different team’s gateway). Sign in again.' : `The agent runtime answered ${up.status}.`;
+      await emit(req.sessionID, { step: 'chat', node: 'agent', label: `Ask the ${me.agent}`, method: 'POST', url, request: { headers: redactHeaders({ authorization: `Bearer ${t.access_token}` }), body: { prompt } },
+        response: { status: up.status, body: (await up.text()).slice(0, 300) }, ms: Date.now() - started, outcome: 'denied', narration: why });
+      return res.status(up.status === 401 || up.status === 403 ? 401 : 502).json({ error: why });
+    }
+    res.writeHead(200, { 'Content-Type': 'text/event-stream', 'Cache-Control': 'no-store', Connection: 'keep-alive' });
+    const calls = new Map(), answer = [];
+    const handle = async (ev) => {
+      if (ev.type === 'text') answer.push(ev.text);
+      else if (ev.type === 'tool_call') calls.set(ev.id, { name: ev.name, input: ev.input, at: Date.now() });
+      else if (ev.type === 'tool_result') {
+        const c = calls.get(ev.id) || { name: 'a tool', input: {}, at: started };
+        // try_other_tool is how the agent attempts a tool its gateway did not list. The gateway, not the model, then decides.
+        const attempted = c.name === 'try_other_tool';
+        const toolName = attempted ? String(c.input?.tool_name || 'a tool') : c.name;
+        const refused = attempted && ev.status === 'error' && /GATEWAY_REFUSED/.test(ev.text);
+        const parsed = refused ? { error: { code: -32602, message: 'invalid params' } } : { result: { content: [{ type: 'text', text: ev.text }], isError: ev.status === 'error' } };
+        const consentUrl = findConsentUrl(parsed);
+        const verdict = attempted ? blockedVerdict({ name: toolName, gatewayLabel: me.gatewayLabel, refused }) : callVerdict({ name: toolName, status: 200, parsed, consentUrl });
+        const ms = Date.now() - c.at;
+        const rec = { at: c.at, mcp: 'tools/call', tool: toolName, status: 200, ms, rpcError: refused ? 'invalid params' : null, consentUrl,
+          ok: verdict.kind === 'allowed', blocked: attempted || undefined, authorization: redactHeaders({ authorization: `Bearer ${t.access_token}` }).authorization };
+        F(req).gateway.calls.push(rec); F(req).toolCalls.push(rec);
+        await emit(req.sessionID, { step: 'mcp', node: attempted ? 'gateway' : 'toolcall', label: attempted ? `The agent tried “${toolName}”, which the admin did not expose` : `The agent called “${toolName}”`,
+          method: 'POST', url: me.gatewayUrl, request: { headers: {}, body: { tool: toolName, arguments: attempted ? c.input?.arguments || {} : c.input } }, response: { status: 200, body: parsed }, ms, verdict,
+          outcome: ({ consent: 'denied', waking: 'denied', 'blocked-server': 'denied', 'blocked-gateway': 'denied', problem: 'error' })[verdict.kind] || 'ok',
+          narration: attempted
+            ? `Nothing in the agent’s own tool list covers this, so it asked the ${me.gatewayLabel} gateway for ${toolName} by name. The gateway answered MCP error -32602 (“invalid params”): that tool is not exposed to this agent, so the call never reached a downstream service. This agent was told to attempt it, so you see the platform, not the model, refuse.`
+            : `Claude chose ${toolName} from the tools the gateway listed. The agent forwarded ${me.name.split(' ')[0]}’s own token to the gateway, which exchanged it with Okta for a downstream token the agent never saw.` });
+        if (verdict.kind === 'allowed') defer(collectSts(req, c.at, toolName));
+        else if (refused) defer(collectBlocked(req, c.at, toolName));
+      }
+    };
+    let buf = '';
+    const reader = up.body.getReader(), dec = new TextDecoder();
+    try {
+      for (;;) {
+        const { value, done } = await reader.read();
+        if (done) break;
+        const chunk = dec.decode(value, { stream: true });
+        res.write(chunk);
+        buf += chunk;
+        let i;
+        while ((i = buf.indexOf('\n')) >= 0) {
+          const line = buf.slice(0, i).trim(); buf = buf.slice(i + 1);
+          if (line.startsWith('data:')) { try { await handle(JSON.parse(line.slice(5))); } catch { /* a partial or non-JSON line: ignore */ } }
+        }
+      }
+    } catch (e) { res.write(`data: ${JSON.stringify({ type: 'error', message: `The stream broke: ${e.message}` })}\n\n`); }
+    await emit(req.sessionID, { step: 'chat', node: 'agent', label: `Ask the ${me.agent}`, method: 'POST', url, request: { headers: redactHeaders({ authorization: `Bearer ${t.access_token}` }), body: { prompt } },
+      response: { status: 200, body: { tool_calls: [...calls.values()].map((c) => c.name), answer: answer.join('').slice(0, 600) } }, ms: Date.now() - started, outcome: 'ok',
+      narration: `${me.name.split(' ')[0]}’s question went to the ${me.agent} running on Amazon Bedrock AgentCore. AgentCore checked the Okta token against the ${me.gatewayLabel} gateway’s authorization server before the agent saw it. Claude then used ${calls.size} tool call${calls.size === 1 ? '' : 's'}.` });
+    res.end();
+  }));
+
   // Governance check: ask the gateway for a real tool its admin did not expose (another team's tool, or a GitHub write).
   // Only the names listed for personas are allowed, and the call is refused unless the gateway's own tools/list (remembered from this
   // session) shows the tool is NOT exposed, so this can never run anything. Arguments are empty on purpose.

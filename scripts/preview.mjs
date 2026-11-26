@@ -16,13 +16,13 @@ const sleep = (ms) => new Promise((r) => setTimeout(r, ms));
 // ---------- the fake backend ----------
 const T = (name, description, ro = true) => ({ name, description, inputSchema: { type: 'object', properties: {} }, annotations: { readOnlyHint: ro } });
 const PERSONAS = [
-  { key: 'ethan', name: 'Ethan Park', department: 'Engineering', agent: 'Engineering Agent', gatewayLabel: 'Engineering Tools', resourceLabel: 'GitHub', gatewayPath: '/mcp/servers/agent-gateway-agent-gateway', configured: true,
+  { key: 'ethan', chat: true, chips: { ask: ['Who am I on GitHub?', 'Find repositories about Okta'], breakIt: ['Merge pull request 1 on octocat/Hello-World'] }, name: 'Ethan Park', department: 'Engineering', agent: 'Engineering Agent', gatewayLabel: 'Engineering Tools', resourceLabel: 'GitHub', gatewayPath: '/mcp/servers/agent-gateway-agent-gateway', configured: true,
     blockedTools: [{ name: 'GitHubMCP_merge_pull_request', label: 'merge_pull_request (GitHub write)' }, { name: 'GitHubMCP_delete_file', label: 'delete_file (GitHub write)' }, { name: 'CRMMCP_list_deals', label: 'list_deals (Sales CRM)' }, { name: 'HRMCP_get_compensation', label: 'get_compensation (HR)' }],
     tools: [T('GitHubMCP_get_me', 'Get the authenticated user'), T('GitHubMCP_search_repositories', 'Find repositories'), T('GitHubMCP_get_file_contents', 'Read a file')] },
-  { key: 'sofia', name: 'Sofia Reyes', department: 'Sales', agent: 'Sales Agent', gatewayLabel: 'Sales Tools', resourceLabel: 'CRM data', gatewayPath: '/mcp/servers/sales-tools', configured: true,
+  { key: 'sofia', chat: true, chips: { ask: ['Look up Northwind Logistics', 'Which deals are still open?', 'Show me everything about customer C-1002'], breakIt: ['Show me Hannah Cho’s salary', 'List every employee in the HR directory'] }, name: 'Sofia Reyes', department: 'Sales', agent: 'Sales Agent', gatewayLabel: 'Sales Tools', resourceLabel: 'CRM data', gatewayPath: '/mcp/servers/sales-tools', configured: true,
     blockedTools: [{ name: 'HRMCP_get_compensation', label: 'get_compensation (HR)' }, { name: 'GitHubMCP_get_me', label: 'get_me (GitHub)' }],
     tools: [T('CRMMCP_search_customers', 'Search customers'), T('CRMMCP_get_customer', 'Get one customer'), T('CRMMCP_list_deals', 'List deals'), T('CRMMCP_update_deal_stage', 'Move a deal', false)] },
-  { key: 'hannah', name: 'Hannah Cho', department: 'HR', agent: 'HR Agent', gatewayLabel: 'HR Resources', resourceLabel: 'HR data', gatewayPath: '/mcp/servers/hr-resources', configured: true,
+  { key: 'hannah', chat: true, chips: { ask: ['Who works in Engineering?', 'What is Lena Fischer’s compensation?'], breakIt: ['Move the Northwind deal to Closed Won'] }, name: 'Hannah Cho', department: 'HR', agent: 'HR Agent', gatewayLabel: 'HR Resources', resourceLabel: 'HR data', gatewayPath: '/mcp/servers/hr-resources', configured: true,
     blockedTools: [{ name: 'CRMMCP_update_deal_stage', label: 'update_deal_stage (Sales CRM write)' }, { name: 'GitHubMCP_get_me', label: 'get_me (GitHub)' }],
     tools: [T('HRMCP_list_employees', 'List employees'), T('HRMCP_get_employee', 'Get an employee'), T('HRMCP_get_compensation', 'Get salary')] },
 ];
@@ -51,6 +51,32 @@ function flowNodes() {
     sts: { status: past || (S.called ? 'done' : S.consent ? 'waiting' : 'idle'), data: S.called ? { exchange: { result: 'SUCCESS', at: new Date().toISOString() }, oktaGatewayEvents: [{}] } : null },
     ghtoken: { status: past || d(S.called), data: S.called ? { visible: false } : null }, toolcall: { status: past || t, data: { calls: [] } },
   };
+}
+
+// A fake /api/chat: the same events the real agent streams, and the same timeline events the real server records.
+const sse = (events) => events.map((e) => `data: ${JSON.stringify(e)}\n\n`).join('');
+function fakeChat(prompt) {
+  const p = me();
+  if (/salary|compensation|HR directory|Closed Won/i.test(prompt) && !/Lena/.test(prompt)) {
+    const tool = /Closed Won/.test(prompt) ? 'CRMMCP_update_deal_stage' : /directory/.test(prompt) ? 'HRMCP_list_employees' : 'HRMCP_get_compensation';
+    S.flowBlocked = true;
+    ev({ node: 'gateway', label: `The agent tried “${tool}”, which the admin did not expose`, url: GW(p), ms: 410, outcome: 'denied', narration: 'The gateway answered MCP error -32602 (“invalid params”): that tool is not exposed to this agent.',
+      verdict: { kind: 'blocked-gateway', title: 'Blocked by the gateway', detail: `${tool.replace(/^[A-Za-z0-9]*MCP_/, '').replace(/_/g, ' ')} is not one of the tools ${p.gatewayLabel} exposes.`, tool } });
+    return sse([{ type: 'tools', tools: p.tools.map((t) => t.name) }, { type: 'tool_call', id: 't1', name: 'try_other_tool', input: { tool_name: tool, arguments: {} } },
+      { type: 'tool_result', id: 't1', status: 'error', text: 'Error: RuntimeError - GATEWAY_REFUSED: Tool execution failed: invalid params' },
+      { type: 'text', text: `I tried **${tool}**, but the ${p.gatewayLabel} gateway refused it: that tool is not available to this agent. I can't get that for you; I can help with ${p.resourceLabel} instead.` }, { type: 'done' }]);
+  }
+  if (S.consent) {
+    S.consent = false;
+    return sse([{ type: 'tool_call', id: 't1', name: p.tools[0].name, input: { query: 'Northwind' } },
+      { type: 'tool_result', id: 't1', status: 'error', text: 'Connection required: visit https://example-org.oktapreview.com/oauth2/v1/sts/redirect?dataHandle=abc to connect your account.' },
+      { type: 'text', text: 'I need your one-time approval before I can search the CRM.' }, { type: 'done' }]);
+  }
+  S.called = true; S.connected = true;
+  ev({ node: 'toolcall', label: `The agent called “${p.tools[0].name}”`, url: GW(p), ms: 1840, narration: 'Claude chose the tool from the tools the gateway listed. The agent forwarded Sofia’s own token to the gateway.', verdict: { kind: 'allowed', title: 'Allowed', detail: 'Search customers ran through the gateway.', tool: p.tools[0].name } });
+  return sse([{ type: 'tools', tools: p.tools.map((t) => t.name) }, { type: 'tool_call', id: 't1', name: p.tools[0].name, input: { query: 'Northwind' } },
+    { type: 'tool_result', id: 't1', status: 'success', text: '[{"customer_id":"C-1001","name":"Northwind Logistics","tier":"Enterprise"}]' },
+    { type: 'text', text: 'Found one match:\n\n| ID | Customer | Tier | Owner |\n|---|---|---|---|\n| C-1001 | Northwind Logistics | Enterprise | Sofia Reyes |\n\nWant me to pull up its open deals?' }, { type: 'done' }]);
 }
 function route(method, path, body) {
   const p = me();
@@ -107,6 +133,7 @@ ws.onmessage = async (m) => {
     const { requestId, request } = msg.params; const u = new URL(request.url);
     if (!u.pathname.startsWith('/api/')) return send('Fetch.continueRequest', { requestId });
     let body = {}; try { body = JSON.parse(request.postData || '{}'); } catch { /* none */ }
+    if (u.pathname === '/api/chat') return send('Fetch.fulfillRequest', { requestId, responseCode: 200, responseHeaders: [{ name: 'content-type', value: 'text/event-stream' }], body: Buffer.from(fakeChat(body.prompt || '')).toString('base64') });
     const out = route(request.method, u.pathname + u.search, body);
     return send('Fetch.fulfillRequest', { requestId, responseCode: 200, responseHeaders: [{ name: 'content-type', value: 'application/json' }, { name: 'cache-control', value: 'no-store' }], body: Buffer.from(JSON.stringify(out)).toString('base64') });
   }
@@ -125,31 +152,18 @@ const ERRORS = [];
 ws.addEventListener('message', (m) => { const d = JSON.parse(m.data); if (d.method === 'Runtime.exceptionThrown') ERRORS.push(d.params.exceptionDetails.exception?.description?.split('\n')[0] || d.params.exceptionDetails.text); if (d.method === 'Runtime.consoleAPICalled' && d.params.type === 'error') ERRORS.push(d.params.args.map((x) => x.value || x.description).join(' ')); });
 const SCENARIOS = {
   async picker() { reset(); await open(); await shot('01-picker'); },
-  async start() { reset(); await open(); await choose('sofia'); await shot('02-discover'); },
-  async tools() { reset(); await open(); await choose('sofia'); await click('#go'); await sleep(700); await signIn(); await click('#go'); await sleep(900); await shot('03-tools'); },
-  async allowed() { await SCENARIOS.tools(); await click('.tool button[data-i]', 0); await sleep(2800); await shot('04-allowed-table'); await click('.tool button[data-i]', 1); await sleep(2600); await shot('05-allowed-detail'); },
-  async blocked() { await SCENARIOS.tools(); await click('.govCard button[data-blocked]', 0); await sleep(2800); await shot('06-blocked-gateway'); },
-  async okta() { await SCENARIOS.tools(); ev({ step: 'login', label: 'Okta refused Sofia Reyes access to the Engineering Agent', method: 'GET', url: 'https://example-org.oktapreview.com/authorization-code/callback', ms: 0, outcome: 'denied', response: { status: 400 }, narration: 'Okta turned the sign-in away before issuing anything: access_denied (“User is not assigned to the client application.”). Sofia Reyes is not assigned to the Engineering Agent, so they cannot use another team’s agent, whatever that agent’s gateway holds. This is the first line of defence.', verdict: { kind: 'blocked-okta', title: 'Blocked by Okta', detail: 'Sofia Reyes is not assigned to the Engineering Agent.', target: { agent: 'Engineering Agent', gateway: 'Engineering Tools', resource: 'GitHub' } } }); await sleep(2500); await shot('07-blocked-okta'); },
-  async consent() { reset(); await open(); await choose('ethan'); S.consent = true; await click('#go'); await sleep(700); await signIn(); await click('#go'); await sleep(900); await click('.tool button[data-i]', 0); await sleep(2500); await shot('08-consent'); },
-  // REAL=1 only: drives the real server as far as it can go without a password (picker, choose, discover) and reports what the page shows.
-  async real() { await open(); await choose('sofia'); await click('#go'); await sleep(2500); console.log('trace cards on the page:', await ev$("document.querySelectorAll('#feed .ev').length"), '| count label:', await ev$("document.querySelector('#count').textContent"), '| console errors:', JSON.stringify(ERRORS)); await shot('10-real-discover'); },
-  // REAL=1 only: the bug where an open page kept a high event number from before a server restart and then ignored every new event.
-  async stale() {
-    await open(); await choose('sofia'); await click('#go'); await sleep(2000);
-    console.log('before:', await ev$("document.querySelectorAll('#feed .ev').length"), 'cards');
-    await ev$('lastId = 50'); // what a page open across a server restart looks like
-    await click('#switch'); await sleep(600); await choose('sofia'); await click('#go'); await sleep(2500);
-    console.log('after switching persona with a stale number:', await ev$("document.querySelectorAll('#feed .ev').length"), 'cards (3 expected)', '| lastId now', await ev$('lastId'));
-  },
-  // Stands in for the trip to Okta and back: leaving stores the tool list, returning restores it, so the page lands on step 4 and not on Connect.
-  async roundtrip() {
-    await SCENARIOS.tools();
-    await ev$("document.body.dispatchEvent(new Event('x')); (()=>{const a=document.createElement('a');a.href='/auth/probe/ethan';a.id='fakeProbe';a.onclick=(e)=>e.preventDefault();document.body.append(a);a.click();})()");
-    await open(); await sleep(800);
-    console.log('step after returning:', await ev$("document.querySelector('#steps li.active b').textContent"), '| tool tiles:', await ev$("document.querySelectorAll('.tool').length"));
-  },
-  async hood() { await SCENARIOS.allowed(); await click('#hood'); await sleep(800); await shot('09-under-the-hood'); },
+  // Also clicks the button: the page must call discovery and then head for /auth/login (the fake backend answers discovery; Chrome then leaves for the real path).
+  async start() { reset(); await open(); await choose('sofia'); await shot('02-sign-in'); await click('#go'); await sleep(1200); console.log('after Sign in, the page is at:', await ev$('location.pathname')); },
+  async chat() { reset(); await open(); await choose('sofia'); await signIn(); await shot('03-chat-empty'); },
+  async allowed() { await SCENARIOS.chat(); await click('.chip[data-p]', 0); await sleep(1500); await shot('04-chat-allowed'); },
+  async blocked() { await SCENARIOS.chat(); await click('.chip.warn[data-p]', 0); await sleep(1500); await shot('05-chat-blocked'); },
+  async consent() { await SCENARIOS.chat(); S.consent = true; await click('.chip[data-p]', 0); await sleep(1500); await shot('06-chat-consent'); },
+  async okta() { await SCENARIOS.chat(); ev({ step: 'login', label: 'Okta refused Sofia Reyes access to the HR Agent', method: 'GET', url: 'https://example-org.oktapreview.com/authorization-code/callback', ms: 0, outcome: 'denied', narration: 'Okta refused the sign-in: Sofia is not assigned to the HR Agent.', verdict: { kind: 'blocked-okta', title: 'Blocked by Okta', detail: 'Sofia Reyes is not assigned to the HR Agent.', target: { agent: 'HR Agent', gateway: 'HR Resources', resource: 'HR data' } } }); await sleep(2500); await shot('07-okta'); await click('#backBtn'); await sleep(500); await shot('07b-back-to-chat'); },
+  async hood() { await SCENARIOS.allowed(); await click('#hood'); await sleep(800); await shot('08-under-the-hood'); },
+  // REAL=1 only: drives the real server as far as it can go without a password (picker, choose) and reports what the page shows.
+  async real() { await open(); await choose('sofia'); await sleep(1500); console.log('sign-in card:', await ev$("document.querySelector('#go')?.textContent"), '| steps:', await ev$("[...document.querySelectorAll('#steps li b')].map((b) => b.textContent).join(' > ')")); await shot('real-sign-in'); },
 };
 try {
-  for (const name of (WANT.length ? WANT : Object.keys(SCENARIOS))) { console.log('scenario', name); await SCENARIOS[name](); }
+  for (const name of (WANT.length ? WANT : Object.keys(SCENARIOS).filter((n) => n !== 'real'))) { console.log('scenario', name); await SCENARIOS[name](); }
 } finally { ws.close(); proc.kill(); }
+if (ERRORS.length) { console.error('PAGE ERRORS (the page threw while being driven):\n  ' + [...new Set(ERRORS)].join('\n  ')); process.exitCode = 1; }

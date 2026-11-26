@@ -15,6 +15,11 @@ Start with `npm run preflight -- --check` (changes nothing) and `npm run okta --
 | `connect` says `needs the GitHub App client ID and secret` | Part 4 skipped | Add `GITHUB_APP_CLIENT_ID/SECRET` to `.env` and run it again, or ignore: Sales and HR still work |
 | `connect` prints a consent link and stops | The terminal is not interactive | Approve the link as an admin who is in the team's group, then run the same command again |
 | `connect` fails with `tool ... was not discovered` | The MCP server does not answer, so Okta could not list its tools | Check `curl -i -X POST $MCP_API_BASE/crm -d '{}'` returns `401` with a `www-authenticate` header. Then run `connect` again |
+| `deploy-agents.sh`: `Docker is not running` | Docker Desktop (or the daemon) is stopped | Start it; `docker info` must work |
+| `deploy-agents.sh` is slow on an Intel machine | The ARM64 image is built by emulation | Expected; allow several minutes, or build on an Apple Silicon or ARM machine |
+| `deploy-agents.sh`: `No gateway found at ...` | `npm run okta -- connect` has not created the gateways yet | Run `connect` first (Part 5), then this again |
+| `deploy-agents.sh` fails creating a runtime with an access-denied or model error | The Bedrock model is not enabled, or your role cannot create AgentCore runtimes | Enable the model (Bedrock console, Model access) and check the `converse` command in the setup guide's prerequisites; ask your AWS admin about AgentCore permissions |
+| The agent ARNs changed after re-running `deploy-agents.sh` | CloudFormation replaces the runtimes when the image changes | Copy the three printed ARNs into `.env` and restart (`npm run preflight`) |
 | `status` shows `!` for something you created by hand | The names differ from the ones the demo expects | Rename it (see the table in [ARCHITECTURE.md](ARCHITECTURE.md)) or let `connect` create the expected one |
 
 ## Running problems
@@ -22,6 +27,11 @@ Start with `npm run preflight -- --check` (changes nothing) and `npm run okta --
 | Symptom | Likely cause | Fix |
 |---|---|---|
 | Okta shows an error page when signing in | The agent's app has no group assigned, a different group than the user's, or the redirect URI is wrong | The agent's app must list `http://localhost:8080/authorization-code/callback` and be assigned only to the team's group. `npm run preflight` reports both |
+| The chat answers `AgentCore refused the token` | The sign-in token expired (about an hour), or it was issued for a different team's gateway | Sign in again. Each runtime accepts only its own team's gateway tokens |
+| The chat says the agent could not be reached, or returns 5xx | The runtime is not `READY`, the ARN in `.env` is stale, or Claude is not enabled | `npm run preflight -- --check` reports each runtime; check the ARNs and the Bedrock model access |
+| The chat shows `[ValidationException ... temperature ...]` or a model error | The chosen Claude model rejects a setting, or is not available in the region | Pass a model your region offers with `deploy-agents.sh --model`; the code sets no sampling options |
+| The agent says it has "no tool" for a break-it prompt instead of trying | Claude chose to decline | Ask more directly, or use **Sign in to another team's agent**, which is deterministic |
+| A tool step stays running for 15–30 s | Aurora is waking from its pause | Wait; run `npm run preflight` beforehand next time |
 | "Not set up" on a person's card | Their agent client ID or secret is missing from `.env` | `npm run okta -- env` and copy the values; restart `npm start` |
 | Tools list is empty, or says "Connection required" | The person has not given consent, or the connection's credentials are stale | Click the consent link. If it persists, check that the gateway's connection is ACTIVE with the tools on (`npm run okta -- status`) |
 | `Connection required: visit https://.../sts/redirect?...` | Same as above (Okta returns it as a normal tool result, not an error) | Open the link, approve, retry |
@@ -39,4 +49,4 @@ In the System Log (Reports → System Log) filter by `eventType sw "agent_gatewa
 
 ## Starting over
 
-`npm run okta -- teardown` and `aws cloudformation delete-stack --stack-name agw-demo`, then repeat Parts 2 to 6 of [SETUP.md](SETUP.md). Delete `.okta-demo.json` first so new passwords and secrets are recorded.
+`npm run okta -- teardown`, `aws cloudformation delete-stack --stack-name agw-demo-agents` and `aws cloudformation delete-stack --stack-name agw-demo`, then repeat Parts 2 to 7 of [SETUP.md](SETUP.md). Delete `.okta-demo.json` first so new passwords and secrets are recorded.

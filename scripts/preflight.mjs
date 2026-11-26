@@ -161,6 +161,15 @@ async function main() {
       f.State === 'Active' && f.LastUpdateStatus === 'Successful' ? say('ok', `${fn} is deployed and active`) : say('fail', `${fn} is ${f.State}/${f.LastUpdateStatus}`);
     } catch (e) { say('fail', `${fn}: ${errText(e)}`); }
   }
+  // The three team agents on AgentCore: each person's chat needs their runtime to exist and be READY.
+  for (const [key, who] of [['ENGINEERING_AGENT_RUNTIME_ARN', 'Engineering'], ['SALES_AGENT_RUNTIME_ARN', 'Sales'], ['HR_AGENT_RUNTIME_ARN', 'HR']]) {
+    const arn = env[key];
+    if (!arn) { say('warn', `${who} agent runtime (${key}) is not set, so that person has no chat`); continue; }
+    try {
+      const r = aws(['bedrock-agentcore-control', 'get-agent-runtime', '--agent-runtime-id', arn.split('/').pop()]);
+      r.status === 'READY' ? say('ok', `${who} agent runtime is ready`) : say('fail', `${who} agent runtime is ${r.status}`);
+    } catch (e) { say('fail', `${who} agent runtime: ${errText(e)}`); }
+  }
   // The public face of each MCP server: reachable, and refusing anonymous callers the right way.
   const apiBase = (env.MCP_API_BASE || '').replace(/\/+$/, '');
   if (!apiBase) say('fail', 'MCP_API_BASE is not set, so the two MCP servers cannot be checked', 'it is the McpApiUrl output of the AWS stack');
