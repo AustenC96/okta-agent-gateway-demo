@@ -49,4 +49,4 @@ In the System Log (Reports → System Log) filter by `eventType sw "agent_gatewa
 
 ## Starting over
 
-`npm run okta -- teardown` and `aws cloudformation delete-stack --stack-name agw-demo`, then repeat Parts 2 to 6 of [SETUP.md](SETUP.md). Delete `.okta-demo.json` first so new passwords and secrets are recorded.
+`npm run okta -- teardown`, `aws cloudformation delete-stack --stack-name agw-demo-agents` and `aws cloudformation delete-stack --stack-name agw-demo`, then repeat Parts 2 to 7 of [SETUP.md](SETUP.md). Delete `.okta-demo.json` first so new passwords and secrets are recorded.
