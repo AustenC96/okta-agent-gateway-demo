@@ -16,8 +16,6 @@ async function api(path, body) {
 const carried = JSON.parse(sessionStorage.getItem('carriedTrace') || 'null');
 sessionStorage.removeItem('carriedTrace');
 // The tool list lives in the page, so it is carried across the trip to Okta and back too; otherwise the page would drop back to "Connect".
-const carriedTools = JSON.parse(sessionStorage.getItem('carriedTools') || 'null');
-sessionStorage.removeItem('carriedTools');
 const seen = [];
 let lastId = 0;
 // The server says how to follow the trace: a live stream, or short polls on hosts that cannot hold a stream open.
@@ -40,7 +38,6 @@ function showLive(ev) { if ((ev.id || 0) > lastId) renderEvent(ev, false); }
 document.addEventListener('click', (e) => {
   if (e.target.closest('a[href^="/auth/"]')) {
     sessionStorage.setItem('carriedTrace', JSON.stringify({ events: seen, lastId }));
-    if (state.tools) sessionStorage.setItem('carriedTools', JSON.stringify(state.tools));
   }
 });
 function renderEvent(ev, instant) {
@@ -117,69 +114,183 @@ function renderPersonas() {
       </button>`).join('')}</div>`;
   box.querySelectorAll('button[data-key]').forEach((b) => b.onclick = () => choosePersona(b.dataset.key));
 }
-// The two governance checks, framed as layers of defence: Okta decides who may use which agent, the gateway decides which tools exist.
-function governHtml(busy) {
-  const me = currentPersona();
-  const others = (state.cfg?.personas || []).filter((p) => p.configured && p.key !== me?.key);
-  const tools = me ? me.blockedTools : [{ name: 'GitHubMCP_merge_pull_request', label: 'merge_pull_request' }, { name: 'GitHubMCP_delete_file', label: 'delete_file' }];
-  const agentCard = me && others.length ? `<div class="govCard"><span class="layer">Layer 1 · Okta</span><h4>Another team’s agent</h4>
-    <div class="govBtns">${others.map((p) => `<a class="btn outline" href="/auth/probe/${esc(p.key)}">Try the ${esc(p.agent)}</a>`).join('')}</div></div>` : '';
-  const toolCard = `<div class="govCard"><span class="layer">Layer 2 · Gateway</span><h4>A tool it doesn’t have</h4>
-    <div class="govBtns">${tools.map((t) => `<button class="outline" data-blocked="${esc(t.name)}" ${busy}>${esc(t.label)}</button>`).join('')}</div></div>`;
-  return `<h3 class="govTitle">Now try to break it</h3><div class="govGrid">${agentCard}${toolCard}</div>`;
-}
-
 // ---------- stage ----------
-function currentStep() {
-  if (!state.discovered) return 'discover';
-  if (!state.cfg?.signedIn) return 'login';
-  if (!state.tools) return 'session';
-  return 'tools';
-}
+// Two steps now: the page signs the person in, and the team's agent does everything else (connecting, choosing tools, calling them).
+function currentStep() { return state.cfg?.signedIn ? 'ask' : 'login'; }
 function render() {
   const picking = needsPersona();
   $('#personas').hidden = !picking;
   $('main').hidden = picking;
   if (picking) { renderPersonas(); return; }
   const cur = currentStep();
-  const order = ['discover', 'login', 'session', 'tools'];
+  const order = ['login', 'ask'];
   document.querySelectorAll('#steps li').forEach((li) => {
     const i = order.indexOf(li.dataset.step), c = order.indexOf(cur);
     li.className = i < c ? 'done' : i === c ? 'active' : '';
   });
   const me = currentPersona();
   const first = me ? me.name.split(' ')[0] : 'the user';
-  const body = $('#stageBody');
-  const busy = state.busy ? 'disabled' : '';
-  const consent = state.consentUrl ? `<div class="consent">One-time consent needed. <a href="${esc(state.consentUrl)}" target="_blank" rel="noopener">Authorize access →</a> then retry.</div>` : '';
-  if (cur === 'discover') {
-    body.innerHTML = `<h2>Discover the gateway</h2><p class="lead">The agent starts with one URL and no credentials.</p><button class="primary" id="go" ${busy}>Discover</button>`;
-    $('#go').onclick = () => run(async () => { await api('/api/discover', {}); });
-  } else if (cur === 'login') {
-    body.innerHTML = `<h2>Sign in</h2><p class="lead">The agent acts as ${esc(first)}, not as a shared account.</p><a class="btn" href="/auth/login">Sign in with Okta</a>`;
-  } else if (cur === 'session') {
-    body.innerHTML = `<h2>Connect</h2><p class="lead">Open a session and ask which tools ${me ? esc(first) + '’s agent' : 'the agent'} may use.</p><button class="primary" id="go" ${busy}>Connect</button>${consent}`;
-    $('#go').onclick = () => run(async () => {
-      state.consentUrl = null;
-      const init = await api('/api/mcp/initialize', {});
-      if (init.error) return;
-      const t = await api('/api/mcp/tools', {});
-      state.consentUrl = t.consentUrl || null;
-      if (t.result?.tools) state.tools = t.result.tools;
-    });
-  } else {
-    const tiles = state.tools.length ? state.tools.map((t, i) => {
-      const ro = isReadOnly(t);
-      return `<div class="tool"><div class="tTop"><span class="tName">${esc(prettyTool(t))}</span><span class="chip2 ${ro ? 'read' : 'write'}">${ro ? 'Read' : 'Write'}</span></div>
-        <code>${esc(t.name)}</code>
-        ${ro ? `<button data-i="${i}" ${busy} title="Sample input: ${esc(JSON.stringify(sampleArgs(t)))}">Run</button>` : '<button disabled title="This tool changes data, so the demo does not run it">Run</button>'}</div>`;
-    }).join('') : '<p class="lead">The gateway returned no tools. Ask the admin to expose some on the virtual MCP server.</p>';
-    body.innerHTML = `<div class="sectionHead"><h2>${me ? `Tools ${esc(first)} can use` : 'Tools available'}</h2><span>${state.tools.length} on ${esc(me?.gatewayLabel || 'this gateway')}</span></div><div class="tools">${tiles}</div>${governHtml(busy)}`;
-    body.querySelectorAll('.govern button[data-blocked],.govCard button[data-blocked]').forEach((b) => b.onclick = () => callBlocked(b.dataset.blocked));
-    body.querySelectorAll('.tool button[data-i]').forEach((b) => b.onclick = () => callTool(state.tools[b.dataset.i]));
+  const stage = $('#stage');
+  stage.hidden = cur !== 'login';
+  if (cur === 'login') {
+    const busy = state.busy ? 'disabled' : '';
+    $('#stageBody').innerHTML = `<h2>Sign in</h2><p class="lead">The ${esc(me?.agent || 'agent')} acts as ${esc(first)}, not as a shared account.</p><button class="primary" id="go" ${busy}>Sign in with Okta</button>`;
+    // The app reads the gateway's sign-in metadata first (discovery), then sends the person to Okta.
+    $('#go').onclick = () => run(async () => { await api('/api/discover', {}); location.href = '/auth/login'; });
   }
   renderVerdict();
   renderFlow();
+  renderChat();
+}
+
+// ---------- chat with the team's agent ----------
+// Patterns borrowed from the chat apps people already know: a centred message column, starter prompts above the composer, a composer that
+// sends on Enter, and tool use shown as collapsible step rows inside the answer (as Claude and ChatGPT show it).
+function md(src) {
+  const e = (t) => t.replace(/&/g, '&amp;').replace(/</g, '&lt;').replace(/>/g, '&gt;');
+  const inline = (t) => e(t).replace(/`([^`]+)`/g, '<code>$1</code>').replace(/\*\*([^*]+)\*\*/g, '<strong>$1</strong>')
+    .replace(/(^|[^*])\*([^*\n]+)\*/g, '$1<em>$2</em>').replace(/\[([^\]]+)\]\((https?:\/\/[^)\s]+)\)/g, '<a href="$2" target="_blank" rel="noopener">$1</a>')
+    .replace(/(^|[\s(])(https?:\/\/[^\s<)]+)/g, '$1<a href="$2" target="_blank" rel="noopener">$2</a>');
+  const L = String(src || '').split('\n'), out = [];
+  const isRow = (l) => /^\s*\|.*\|\s*$/.test(l || ''), isSep = (l) => /^\s*\|?[\s:|-]+\|[\s:|-]*$/.test(l || '') && /-/.test(l || '');
+  const cells = (l) => l.trim().replace(/^\||\|$/g, '').split('|').map((c) => c.trim());
+  for (let i = 0; i < L.length;) {
+    const l = L[i];
+    if (isRow(l) && isSep(L[i + 1])) {
+      const head = cells(l); i += 2; const rows = [];
+      while (i < L.length && isRow(L[i])) rows.push(cells(L[i++]));
+      out.push(`<div class="tblWrap"><table><thead><tr>${head.map((h) => `<th>${inline(h)}</th>`).join('')}</tr></thead><tbody>${rows.map((r) => `<tr>${r.map((c) => `<td>${inline(c)}</td>`).join('')}</tr>`).join('')}</tbody></table></div>`);
+    } else if (/^\s*[-*]\s+/.test(l)) {
+      const it = []; while (i < L.length && /^\s*[-*]\s+/.test(L[i])) it.push(L[i++].replace(/^\s*[-*]\s+/, ''));
+      out.push(`<ul>${it.map((x) => `<li>${inline(x)}</li>`).join('')}</ul>`);
+    } else if (/^\s*\d+[.)]\s+/.test(l)) {
+      const it = []; while (i < L.length && /^\s*\d+[.)]\s+/.test(L[i])) it.push(L[i++].replace(/^\s*\d+[.)]\s+/, ''));
+      out.push(`<ol>${it.map((x) => `<li>${inline(x)}</li>`).join('')}</ol>`);
+    } else if (/^#{1,4}\s+/.test(l)) { out.push(`<h4>${inline(l.replace(/^#+\s+/, ''))}</h4>`); i++; }
+    else if (!l.trim()) i++;
+    else {
+      const para = [];
+      while (i < L.length && L[i].trim() && !/^\s*([-*]\s|\d+[.)]\s|#{1,4}\s)/.test(L[i]) && !(isRow(L[i]) && isSep(L[i + 1]))) para.push(L[i++]);
+      if (!para.length) para.push(L[i++]);
+      out.push(`<p>${inline(para.join(' '))}</p>`);
+    }
+  }
+  return out.join('');
+}
+
+let pendingConsent = null; // { url, prompt, opened }
+let chatBusy = false;
+function renderChat() {
+  const box = $('#chat'), me = currentPersona();
+  const on = !!(me?.chat && state.cfg?.signedIn);
+  box.hidden = !on;
+  if (!on) { delete box.dataset.ready; pendingConsent = null; chatBusy = false; return; }
+  if (box.dataset.ready) return;
+  box.dataset.ready = '1';
+  const first = me.name.split(' ')[0], chips = me.chips || { ask: [], breakIt: [] };
+  const others = (state.cfg?.personas || []).filter((p) => p.configured && p.key !== me.key);
+  box.innerHTML = `
+    <div class="chatHead"><div class="chatTitle">${icon('agent')}<div><b>${esc(me.agent)}</b><span>Acting for ${esc(first)} · Claude on Amazon Bedrock AgentCore</span></div></div></div>
+    <div class="chatLog" id="chatLog" aria-live="polite">
+      <div class="chatEmpty"><h3>What would you like ${esc(first)}’s agent to do?</h3><p>It can only use the tools ${esc(me.gatewayLabel)} gives it.</p></div>
+    </div>
+    <div class="chips" id="chips">
+      <div class="chipRow"><span class="chipLabel">Try asking</span>${chips.ask.map((c) => `<button type="button" class="chip" data-p="${esc(c)}">${esc(c)}</button>`).join('')}</div>
+      <div class="chipRow"><span class="chipLabel warn">${icon('shield')}Try to break it</span>${chips.breakIt.map((c) => `<button type="button" class="chip warn" data-p="${esc(c)}">${esc(c)}</button>`).join('')}
+        ${others.map((p) => `<a class="chip warn" href="/auth/probe/${esc(p.key)}">Sign in to the ${esc(p.agent)}</a>`).join('')}</div>
+    </div>
+    <form class="composer" id="composer"><input id="chatIn" placeholder="Message ${esc(me.agent)}…" autocomplete="off" maxlength="2000"><button class="send" id="chatSend" aria-label="Send">${'<svg viewBox="0 0 24 24" class="i"><path d="M5 12h14M13 6l6 6-6 6"/></svg>'}</button></form>
+    <p class="chatNote">This agent is told to <i>attempt</i> other teams’ tools if you ask, so you see Okta and the gateway refuse, not the model.</p>`;
+  const log = $('#chatLog'), send = $('#chatSend'), input = $('#chatIn');
+  const scroll = () => { log.scrollTop = log.scrollHeight; };
+  const clearEmpty = () => log.querySelector('.chatEmpty')?.remove();
+  const setBusy = (b) => { chatBusy = b; send.disabled = b; input.disabled = b; box.classList.toggle('busy', b); if (!b) input.focus(); };
+
+  function addUser(text) { clearEmpty(); log.insertAdjacentHTML('beforeend', `<div class="row you"><div class="bubble">${esc(text)}</div></div>`); scroll(); }
+  function addAgent() {
+    clearEmpty();
+    const row = document.createElement('div'); row.className = 'row agent';
+    row.innerHTML = `<div class="avatar">${icon('agent')}</div><div class="body"><div class="steps"></div><div class="answer"></div><div class="thinking"><i></i><i></i><i></i></div></div>`;
+    log.appendChild(row); scroll();
+    return { row, steps: row.querySelector('.steps'), answer: row.querySelector('.answer'), thinking: row.querySelector('.thinking'), text: '' };
+  }
+  function addStep(m, ev) {
+    const attempt = ev.name === 'try_other_tool';
+    const nameOf = attempt ? String(ev.input?.tool_name || 'another tool') : ev.name;
+    const d = document.createElement('details'); d.className = `step running${attempt ? ' attempt' : ''}`; d.dataset.id = ev.id; d.dataset.started = Date.now();
+    d.innerHTML = `<summary><span class="stIcon"></span><span class="stTitle">${attempt ? 'Trying' : 'Using'} <b>${esc(prettyTool({ name: nameOf }))}</b></span><code>${esc(nameOf)}</code><span class="stTime"></span></summary>
+      <div class="stBody"><div class="k">Input</div><pre>${esc(JSON.stringify(attempt ? ev.input?.arguments || {} : ev.input, null, 2))}</pre><div class="k stResK" hidden>Result</div><pre class="stRes" hidden></pre></div>`;
+    m.steps.appendChild(d);
+    d._timer = setInterval(() => {
+      const s = Math.round((Date.now() - d.dataset.started) / 1000);
+      d.querySelector('.stTime').textContent = s >= 6 ? `${s}s · the demo database may be waking up` : s ? `${s}s` : '';
+    }, 1000);
+    scroll();
+  }
+  function finishStep(m, ev) {
+    const d = m.steps.querySelector(`details[data-id="${CSS.escape(ev.id)}"]`); if (!d) return;
+    clearInterval(d._timer);
+    const attempt = d.classList.contains('attempt'), refused = attempt && /GATEWAY_REFUSED/.test(ev.text);
+    const consent = /Connection required: visit (https?:\/\/\S+?)(?:\s|$)/.exec(ev.text);
+    const bad = ev.status === 'error' || refused;
+    d.classList.remove('running'); d.classList.add(consent ? 'consent' : refused ? 'blocked' : bad ? 'err' : 'ok');
+    d.querySelector('.stTime').textContent = consent ? 'consent needed' : refused ? 'blocked by the gateway' : bad ? 'failed' : 'done';
+    const res = d.querySelector('.stRes'); res.hidden = false; d.querySelector('.stResK').hidden = false;
+    res.textContent = refused ? 'The gateway refused: this tool is not exposed to this agent (MCP error -32602, invalid params).' : ev.text.slice(0, 1500);
+    if (consent) pendingConsent = { url: consent[1], prompt: m.prompt, opened: false };
+  }
+  function paint(m) { m.answer.innerHTML = md(m.text); if (m.text) m.thinking.hidden = true; scroll(); }
+
+  async function ask(prompt) {
+    setBusy(true);
+    const m = addAgent(); m.prompt = prompt;
+    try {
+      const r = await fetch('/api/chat', { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify({ prompt }) });
+      if (!r.ok) { m.thinking.remove(); m.answer.innerHTML = `<p class="err">${esc((await r.json().catch(() => ({}))).error || `Something went wrong (${r.status}).`)}</p>`; return; }
+      const reader = r.body.getReader(), dec = new TextDecoder(); let buf = '';
+      for (;;) {
+        const { value, done } = await reader.read(); if (done) break;
+        buf += dec.decode(value, { stream: true });
+        let i; while ((i = buf.indexOf('\n')) >= 0) {
+          const line = buf.slice(0, i).trim(); buf = buf.slice(i + 1);
+          if (!line.startsWith('data:')) continue;
+          let ev; try { ev = JSON.parse(line.slice(5)); } catch { continue; }
+          if (ev.type === 'text') { m.text += ev.text; paint(m); }
+          else if (ev.type === 'tool_call') addStep(m, ev);
+          else if (ev.type === 'tool_result') finishStep(m, ev);
+          else if (ev.type === 'error') { m.text += `\n\n_${ev.message}_`; paint(m); }
+        }
+      }
+    } catch (e) { m.answer.innerHTML = `<p class="err">${esc(e.message)}</p>`; }
+    finally {
+      m.thinking.remove(); m.steps.querySelectorAll('details.running').forEach((d) => { clearInterval(d._timer); d.classList.remove('running'); });
+      if (pendingConsent && pendingConsent.prompt === prompt && !pendingConsent.shown) {
+        pendingConsent.shown = true;
+        const c = document.createElement('div'); c.className = 'consentCard';
+        c.innerHTML = `<b>One-time consent needed.</b> Okta has to ask ${esc(first)} to approve access once.
+          <div class="cActs"><a class="btn" target="_blank" rel="noopener" href="${esc(pendingConsent.url)}">Authorize access →</a><button type="button" class="ghost" id="retryBtn">I’ve approved, retry</button></div>
+          <div class="muted">When you come back to this tab the question is asked again automatically.</div>`;
+        c.querySelector('a').onclick = () => { pendingConsent.opened = true; };
+        c.querySelector('#retryBtn').onclick = retry;
+        m.row.querySelector('.body').appendChild(c);
+      }
+      setBusy(false); scroll();
+    }
+  }
+  function retry() {
+    if (!pendingConsent || chatBusy) return;
+    const { prompt } = pendingConsent; pendingConsent = null;
+    addUser(`${prompt}  (asking again)`); ask(prompt);
+  }
+  function submit(text) {
+    const prompt = String(text || '').trim();
+    if (!prompt || chatBusy) return;
+    input.value = ''; pendingConsent = null; addUser(prompt); ask(prompt);
+  }
+  $('#composer').onsubmit = (e) => { e.preventDefault(); submit(input.value); };
+  box.querySelectorAll('.chip[data-p]').forEach((b) => b.onclick = () => submit(b.dataset.p));
+  window.addEventListener('focus', () => { if (pendingConsent?.opened) retry(); });
+  input.focus();
 }
 const prettyTool = (t) => { const s = baseName(t).replace(/_/g, ' '); return s.charAt(0).toUpperCase() + s.slice(1); };
 
@@ -200,8 +311,8 @@ const icon = (n) => `<svg class="i" viewBox="0 0 24 24" aria-hidden="true">${ICO
 function pathState() {
   const n = flow.nodes || {}, st = (id) => n[id]?.status, v = state.verdict, cur = currentStep();
   const signed = !!state.cfg?.signedIn;
-  let gateway = st('gateway') === 'done' ? 'ok' : st('gateway') === 'error' ? 'blocked' : cur === 'session' ? 'active' : 'idle';
-  let data = st('toolcall') === 'done' ? 'ok' : st('toolcall') === 'waiting' ? 'wait' : st('toolcall') === 'error' ? 'blocked' : cur === 'tools' && !v ? 'active' : 'idle';
+  let gateway = st('gateway') === 'done' ? 'ok' : st('gateway') === 'error' ? 'blocked' : cur === 'ask' && !v ? 'active' : 'idle';
+  let data = st('toolcall') === 'done' ? 'ok' : st('toolcall') === 'waiting' ? 'wait' : st('toolcall') === 'error' ? 'blocked' : cur === 'ask' && !v ? 'active' : 'idle';
   if (v?.kind === 'blocked-gateway') gateway = 'blocked';
   if (v?.kind === 'blocked-server') data = 'blocked';
   const signin = v?.kind === 'blocked-okta' ? 'blocked' : st('access') === 'done' ? 'ok' : st('access') === 'error' ? 'blocked' : 'idle';
@@ -315,22 +426,9 @@ function sampleArgs(tool) {
   for (const k of ['perPage', 'per_page']) if (k in props && !(k in args)) args[k] = 3; // keep the answer short
   return args;
 }
-async function callTool(tool) {
-  const args = sampleArgs(tool);
-  run(async () => {
-    state.consentUrl = null;
-    const r = await api('/api/mcp/call', { name: tool.name, arguments: args });
-    state.consentUrl = r.consentUrl || null;
-  });
-}
-async function callBlocked(tool) {
-  run(async () => { state.consentUrl = null; await api('/api/mcp/blocked', { tool }); });
-}
-async function run(fn) { state.busy = true; render(); try { await fn(); } finally { state.busy = false; await load(); } }
 async function load() {
   state.cfg = await api('/api/config');
   state.discovered = state.cfg.discovered;
-  if (carriedTools && state.cfg.signedIn && !state.tools) state.tools = carriedTools;
   const me = currentPersona();
   const t = state.cfg.tokenInfo;
   const initials = me ? me.name.split(' ').map((w) => w[0]).join('').slice(0, 2) : '';

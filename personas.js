@@ -17,6 +17,11 @@ export function personasFromEnv(env) {
       agent: 'Engineering Agent', gatewayLabel: 'Engineering Tools', resourceLabel: 'GitHub',
       gatewayUrl: env.GATEWAY_URL, clientId: env.CLIENT_ID, clientSecret: engPublic ? undefined : env.CLIENT_SECRET,
       callbackPath: env.CALLBACK_PATH || (engPublic ? '/callback' : '/authorization-code/callback'),
+      agentArn: env.ENGINEERING_AGENT_RUNTIME_ARN,
+      chips: {
+        ask: ['Who am I on GitHub?', 'Find repositories about Okta', 'Show me the README of octocat/Hello-World'],
+        breakIt: ['Merge pull request 1 on octocat/Hello-World', 'Show me the open deals in the sales CRM'],
+      },
       blockedTools: [
         { name: 'GitHubMCP_merge_pull_request', label: 'merge_pull_request (GitHub write)' },
         { name: 'GitHubMCP_delete_file', label: 'delete_file (GitHub write)' },
@@ -29,6 +34,11 @@ export function personasFromEnv(env) {
       agent: 'Sales Agent', gatewayLabel: 'Sales Tools', resourceLabel: 'CRM data',
       gatewayUrl: gwAt('sales-tools'), clientId: env.SALES_AGENT_CLIENT_ID, clientSecret: env.SALES_AGENT_CLIENT_SECRET,
       callbackPath: '/authorization-code/callback',
+      agentArn: env.SALES_AGENT_RUNTIME_ARN,
+      chips: {
+        ask: ['Look up Northwind Logistics', 'Which deals are still open?', 'Show me everything about customer C-1002'],
+        breakIt: ['Show me Hannah Cho’s salary', 'List every employee in the HR directory'],
+      },
       blockedTools: [
         { name: 'HRMCP_get_compensation', label: 'get_compensation (HR)' },
         { name: 'GitHubMCP_get_me', label: 'get_me (GitHub)' },
@@ -39,6 +49,11 @@ export function personasFromEnv(env) {
       agent: 'HR Agent', gatewayLabel: 'HR Resources', resourceLabel: 'HR data',
       gatewayUrl: gwAt('hr-resources'), clientId: env.HR_AGENT_CLIENT_ID, clientSecret: env.HR_AGENT_CLIENT_SECRET,
       callbackPath: '/authorization-code/callback',
+      agentArn: env.HR_AGENT_RUNTIME_ARN,
+      chips: {
+        ask: ['Who works in Engineering?', 'What is Lena Fischer’s compensation?', 'Show me the profile for Ben Carter'],
+        breakIt: ['Move the Northwind deal to Closed Won', 'Show me the open deals in the sales CRM'],
+      },
       blockedTools: [
         { name: 'CRMMCP_update_deal_stage', label: 'update_deal_stage (Sales CRM write)' },
         { name: 'GitHubMCP_get_me', label: 'get_me (GitHub)' },
@@ -53,6 +68,6 @@ export function publicPersona(p) {
   const u = p.gatewayUrl ? new URL(p.gatewayUrl) : null;
   return {
     key: p.key, name: p.name, department: p.department, login: p.login, agent: p.agent, gatewayLabel: p.gatewayLabel, resourceLabel: p.resourceLabel,
-    gatewayPath: u ? u.pathname : null, configured: p.configured, blockedTools: p.blockedTools,
+    gatewayPath: u ? u.pathname : null, configured: p.configured, blockedTools: p.blockedTools, chat: !!p.agentArn, chips: p.chips,
   };
 }
