@@ -1,0 +1,189 @@
+AWSTemplateFormatVersion: '2010-09-09'
+Description: >-
+  Okta Agent Gateway demo: the three team agents (Engineering, Sales, HR) hosted on Amazon Bedrock AgentCore Runtime, one Strands + Claude agent
+  image shared by all three. Deploy with infra/deploy-agents.sh, which runs this twice: first without an image (to create the container
+  repository), then with the image you pushed to it (to create the runtimes).
+
+Metadata:
+  cfn-lint:
+    config:
+      ignore_checks: [W1031] # the gateway issuers default to empty until deploy-agents.sh supplies them; the runtimes that use them are not created until then
+
+Parameters:
+  NamePrefix:
+    Type: String
+    Default: agw_demo
+    AllowedPattern: '^[a-z][a-z0-9_]{1,20}$'
+    Description: Prefix for every name this stack creates (runtimes agw_demo_sales, ..., and the image repository). Change it to run a second copy beside the first.
+  ImageUri:
+    Type: String
+    Default: ''
+    Description: The agent image in this stack's repository (ARM64). Leave empty on the first run; the runtimes are created once it is set.
+  ModelId:
+    Type: String
+    Default: us.anthropic.claude-haiku-5-5
+    Description: The Claude inference profile every agent uses. It must be enabled for your account in this region (see docs/SETUP.md).
+  EngineeringGatewayUrl:
+    Type: String
+    Default: ''
+    Description: URL of the Engineering Tools gateway (printed by `npm run okta -- gateways`).
+  EngineeringGatewayIssuer:
+    Type: String
+    Default: ''
+    Description: Issuer of the authorization server Okta created for that gateway (the token's iss claim).
+  SalesGatewayUrl:
+    Type: String
+    Default: ''
+  SalesGatewayIssuer:
+    Type: String
+    Default: ''
+  HrGatewayUrl:
+    Type: String
+    Default: ''
+  HrGatewayIssuer:
+    Type: String
+    Default: ''
+
+Conditions:
+  DeployAgents: !Not [!Equals [!Ref ImageUri, '']]
+
+Resources:
+  # ---------------- where the agent image lives ----------------
+  AgentRepository:
+    Type: AWS::ECR::Repository
+    DeletionPolicy: Delete
+    Properties:
+      RepositoryName: !Sub
+        - '${Dashed}-agent'
+        - Dashed: !Join ['-', !Split ['_', !Ref NamePrefix]]
+      EmptyOnDelete: true # a demo repository should not block the stack from being deleted
+      ImageScanningConfiguration: { ScanOnPush: true }
+      LifecyclePolicy:
+        LifecyclePolicyText: '{"rules":[{"rulePriority":1,"description":"Keep the last 5 images","selection":{"tagStatus":"any","countType":"imageCountMoreThan","countNumber":5},"action":{"type":"expire"}}]}'
+      Tags:
+        - { Key: Project, Value: agent-gateway-demo }
+
+  # ---------------- one least-privilege role shared by the three runtimes ----------------
+  AgentRole:
+    Type: AWS::IAM::Role
+    Properties:
+      AssumeRolePolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Effect: Allow
+            Principal: { Service: bedrock-agentcore.amazonaws.com }
+            Action: 'sts:AssumeRole'
+            Condition:
+              StringEquals: { 'aws:SourceAccount': !Ref 'AWS::AccountId' }
+              ArnLike: { 'aws:SourceArn': !Sub 'arn:${AWS::Partition}:bedrock-agentcore:${AWS::Region}:${AWS::AccountId}:*' }
+      Policies:
+        - PolicyName: agent-runtime
+          PolicyDocument:
+            Version: '2012-10-17'
+            Statement:
+              - { Sid: PullImage, Effect: Allow, Action: ['ecr:BatchGetImage', 'ecr:GetDownloadUrlForLayer'], Resource: !GetAtt AgentRepository.Arn }
+              - { Sid: EcrLogin, Effect: Allow, Action: 'ecr:GetAuthorizationToken', Resource: '*' }
+              - Sid: Logs
+                Effect: Allow
+                Action: ['logs:CreateLogGroup', 'logs:CreateLogStream', 'logs:PutLogEvents', 'logs:DescribeLogStreams']
+                Resource: !Sub 'arn:${AWS::Partition}:logs:${AWS::Region}:${AWS::AccountId}:log-group:/aws/bedrock-agentcore/runtimes/*'
+              - Sid: ClaudeOnBedrock # Anthropic models only, through this account's inference profiles
+                Effect: Allow
+                Action: ['bedrock:InvokeModel', 'bedrock:InvokeModelWithResponseStream']
+                Resource:
+                  - !Sub 'arn:${AWS::Partition}:bedrock:*::foundation-model/anthropic.*'
+                  - !Sub 'arn:${AWS::Partition}:bedrock:*:${AWS::AccountId}:inference-profile/*anthropic*'
+      Tags:
+        - { Key: Project, Value: agent-gateway-demo }
+
+  # ---------------- the three agents ----------------
+  # Each runtime accepts only a valid Okta access token issued by ITS OWN team gateway's authorization server, for that gateway's audience,
+  # and passes the Authorization header on to the agent, which forwards it unchanged to the gateway. Okta decides what the person may do.
+  EngineeringAgent:
+    Type: AWS::BedrockAgentCore::Runtime
+    Condition: DeployAgents
+    Properties:
+      AgentRuntimeName: !Sub '${NamePrefix}_engineering'
+      Description: Agent Gateway demo, Engineering team agent (Strands + Claude)
+      RoleArn: !GetAtt AgentRole.Arn
+      AgentRuntimeArtifact: { ContainerConfiguration: { ContainerUri: !Ref ImageUri } }
+      NetworkConfiguration: { NetworkMode: PUBLIC }
+      ProtocolConfiguration: HTTP
+      AuthorizerConfiguration:
+        CustomJWTAuthorizer:
+          DiscoveryUrl: !Sub '${EngineeringGatewayIssuer}/.well-known/openid-configuration'
+          AllowedAudience: [!Ref EngineeringGatewayUrl]
+      RequestHeaderConfiguration: { RequestHeaderAllowlist: [Authorization] }
+      EnvironmentVariables:
+        TEAM_NAME: Engineering
+        TEAM_BRIEF: You help the engineering team find repositories and read code on GitHub.
+        GATEWAY_URL: !Ref EngineeringGatewayUrl
+        MODEL_ID: !Ref ModelId
+        AWS_REGION: !Ref 'AWS::Region'
+        OTHER_TOOLS: CRMMCP_list_deals,CRMMCP_search_customers,HRMCP_get_compensation,HRMCP_list_employees,GitHubMCP_merge_pull_request,GitHubMCP_delete_file
+      Tags: { Project: agent-gateway-demo }
+
+  SalesAgent:
+    Type: AWS::BedrockAgentCore::Runtime
+    Condition: DeployAgents
+    Properties:
+      AgentRuntimeName: !Sub '${NamePrefix}_sales'
+      Description: Agent Gateway demo, Sales team agent (Strands + Claude)
+      RoleArn: !GetAtt AgentRole.Arn
+      AgentRuntimeArtifact: { ContainerConfiguration: { ContainerUri: !Ref ImageUri } }
+      NetworkConfiguration: { NetworkMode: PUBLIC }
+      ProtocolConfiguration: HTTP
+      AuthorizerConfiguration:
+        CustomJWTAuthorizer:
+          DiscoveryUrl: !Sub '${SalesGatewayIssuer}/.well-known/openid-configuration'
+          AllowedAudience: [!Ref SalesGatewayUrl]
+      RequestHeaderConfiguration: { RequestHeaderAllowlist: [Authorization] }
+      EnvironmentVariables:
+        TEAM_NAME: Sales
+        TEAM_BRIEF: You help the sales team with customers and deals in the CRM.
+        GATEWAY_URL: !Ref SalesGatewayUrl
+        MODEL_ID: !Ref ModelId
+        AWS_REGION: !Ref 'AWS::Region'
+        OTHER_TOOLS: HRMCP_get_compensation,HRMCP_list_employees,HRMCP_get_employee,GitHubMCP_get_me,GitHubMCP_merge_pull_request
+      Tags: { Project: agent-gateway-demo }
+
+  HrAgent:
+    Type: AWS::BedrockAgentCore::Runtime
+    Condition: DeployAgents
+    Properties:
+      AgentRuntimeName: !Sub '${NamePrefix}_hr'
+      Description: Agent Gateway demo, HR team agent (Strands + Claude)
+      RoleArn: !GetAtt AgentRole.Arn
+      AgentRuntimeArtifact: { ContainerConfiguration: { ContainerUri: !Ref ImageUri } }
+      NetworkConfiguration: { NetworkMode: PUBLIC }
+      ProtocolConfiguration: HTTP
+      AuthorizerConfiguration:
+        CustomJWTAuthorizer:
+          DiscoveryUrl: !Sub '${HrGatewayIssuer}/.well-known/openid-configuration'
+          AllowedAudience: [!Ref HrGatewayUrl]
+      RequestHeaderConfiguration: { RequestHeaderAllowlist: [Authorization] }
+      EnvironmentVariables:
+        TEAM_NAME: HR
+        TEAM_BRIEF: You help the HR team with the employee directory and compensation.
+        GATEWAY_URL: !Ref HrGatewayUrl
+        MODEL_ID: !Ref ModelId
+        AWS_REGION: !Ref 'AWS::Region'
+        OTHER_TOOLS: CRMMCP_list_deals,CRMMCP_search_customers,CRMMCP_update_deal_stage,GitHubMCP_get_me,GitHubMCP_merge_pull_request
+      Tags: { Project: agent-gateway-demo }
+
+Outputs:
+  RepositoryUri:
+    Description: Where infra/deploy-agents.sh pushes the agent image
+    Value: !GetAtt AgentRepository.RepositoryUri
+  EngineeringRuntimeArn:
+    Condition: DeployAgents
+    Description: Goes in .env as ENGINEERING_AGENT_RUNTIME_ARN
+    Value: !GetAtt EngineeringAgent.AgentRuntimeArn
+  SalesRuntimeArn:
+    Condition: DeployAgents
+    Description: Goes in .env as SALES_AGENT_RUNTIME_ARN
+    Value: !GetAtt SalesAgent.AgentRuntimeArn
+  HrRuntimeArn:
+    Condition: DeployAgents
+    Description: Goes in .env as HR_AGENT_RUNTIME_ARN
+    Value: !GetAtt HrAgent.AgentRuntimeArn

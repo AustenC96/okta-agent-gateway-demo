@@ -16,6 +16,9 @@ Never commit `.env` or `.okta-demo*.json`, and never paste either into a chat, t
 
 ## What is public, on purpose
 
+The three agents run on Amazon Bedrock AgentCore with a public endpoint. Each one is safe to expose because AgentCore's JWT authorizer rejects anything but a valid Okta access token issued by that team's own gateway authorization server, for that gateway's audience (a Sales token cannot invoke the HR agent). The agent forwards the caller's token to the gateway, so it can do nothing the caller could not. No model or agent holds a credential of its own.
+
+
 The two MCP servers are reachable from the internet through API Gateway, because Okta's gateway has to call them. They are safe to expose
 because **every request must carry an Okta access token** that the Lambda verifies itself: RS256 signature against your authorization
 server's published keys, issuer, audience, expiry, and then the scope each tool needs. An anonymous or forged call gets `401`.
@@ -23,6 +26,8 @@ API Gateway is also throttled (10 requests/second) to cap the cost of anyone ham
 
 ## What this demo does not do
 
+- The agents are told to *attempt* other teams' tools when asked, so the platform visibly refuses them. That makes them an easy target for prompt-injection tricks in a real deployment; here the gateway and Okta, not the model, are the control, and a refused attempt is the demo's point. Do not copy that prompt into a real agent.
+- The agent keeps conversation history in memory and stores nothing else; there is no guardrail layer, rate limit or content filter beyond what Bedrock provides.
 - The web app uses plain HTTP and in-memory sessions and is meant for `localhost` only. Do not host it on the internet.
 - The Okta Agent Gateway APIs are Beta. Treat the bootstrap script as a convenience for a sandbox, not as infrastructure-as-code for production.
 - The demo database is encrypted at rest but has no backups configured beyond Aurora's defaults and deletion protection is off, so it is easy to remove.
@@ -31,7 +36,8 @@ API Gateway is also throttled (10 requests/second) to cap the cost of anyone ham
 
 ```sh
 npm run okta -- teardown                    # removes the Okta groups, users, agents, gateways, MCP servers and authorization servers it created
-aws cloudformation delete-stack --stack-name agw-demo   # removes the database, both Lambdas, the roles and the API
+aws cloudformation delete-stack --stack-name agw-demo-agents   # removes the three agents, their role and the image repository
+aws cloudformation delete-stack --stack-name agw-demo          # removes the database, both Lambdas, the roles and the API
 ```
 
 Then revoke the API token (Admin Console → Security → API → Tokens) and delete the GitHub App if you created one.

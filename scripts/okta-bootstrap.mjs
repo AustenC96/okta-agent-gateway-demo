@@ -3,6 +3,7 @@
 //   status                       read only: shows what exists and what is missing
 //   identity [--add-me]          step 1: groups, the three fictional users, and the two custom authorization servers (--add-me puts you in all three groups)
 //   connect --api-url <url>      step 2: MCP servers, brokered-consent credentials, gateways, tools, agents and the agent -> gateway links
+//   gateways                     prints each team gateway's URL and token issuer as JSON (read only; infra/deploy-agents.sh uses it)
 //   env                          prints the lines to put in .env (agent client IDs and secrets the script created)
 //   teardown                     removes everything the demo created (by name)
 //
@@ -368,6 +369,24 @@ async function connect() {
   }
 }
 
+// ---------- gateways (read only) ----------
+// The AgentCore runtimes must accept exactly the tokens a team's gateway accepts: the gateway URL is the token's audience and the authorization
+// server Okta made for that gateway is its issuer. Okta names that server "Gateway: <path>" and gives it the gateway URL as its audience.
+async function printGateways() {
+  const basePath = (await get('/workload-principals/api/v1/virtual-mcp-settings')).basePath;
+  const servers = await get('/api/v1/authorizationServers?limit=200');
+  const out = {};
+  for (const t of TEAMS) {
+    // A hand-built Engineering gateway may have a different path: GATEWAY_URL (from .env) wins when it is set.
+    const path = t.github && env.GATEWAY_URL ? new URL(env.GATEWAY_URL).pathname.split('/').filter(Boolean).pop() : slug(t.path);
+    const url = `${basePath}/${path}`;
+    const as = servers.find((a) => (a.audiences || []).includes(url));
+    if (!as) { console.error(`No gateway found at ${url}: run "npm run okta -- connect" first.`); process.exit(1); }
+    out[t.key] = { url, issuer: as.issuer };
+  }
+  console.log(JSON.stringify(out));
+}
+
 // ---------- env ----------
 function printEnv() {
   const a = state.agents || {};
@@ -424,12 +443,13 @@ async function teardown() {
 
 // ---------- main ----------
 async function main() {
-  if (!['status', 'identity', 'connect', 'env', 'teardown'].includes(cmd)) {
-    console.log('Usage: npm run okta -- <status | identity | connect --api-url <url> | env | teardown>   (add --tag <word> to rehearse beside an existing demo)');
+  if (!['status', 'identity', 'connect', 'gateways', 'env', 'teardown'].includes(cmd)) {
+    console.log('Usage: npm run okta -- <status | identity | connect --api-url <url> | gateways | env | teardown>   (add --tag <word> to rehearse beside an existing demo)');
     process.exit(cmd ? 2 : 0);
   }
   if (!base || !token) { console.error('Set OKTA_ORG_URL and OKTA_API_TOKEN (an SSWS token created by a super administrator) in .env or the environment.'); process.exit(2); }
   if (cmd === 'env') return printEnv();
+  if (cmd === 'gateways') return printGateways();
   console.log(c(1, `\nOkta ${cmd}${TAG ? ` (tag "${TAG}")` : ''}${DRY ? ' (read only)' : ''} on ${base}`));
   if (cmd === 'teardown') await teardown();
   if (cmd === 'identity' || cmd === 'status') await identity();
