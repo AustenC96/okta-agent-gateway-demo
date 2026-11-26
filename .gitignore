@@ -4,3 +4,12 @@ node_modules
 
 # Lambda build artifacts
 infra/*.zip
+
+# Local state and secrets: never commit these
+.env.*
+!.env.example
+.okta-demo*.json
+HANDOFF.md
+.claude/
+*.log
+.DS_Store

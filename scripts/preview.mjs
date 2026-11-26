@@ -46,7 +46,7 @@ function flowNodes() {
   const past = S.flowBlocked ? 'idle' : null;
   return {
     discover: { status: d(S.discovered), data: { resource: 'x' } }, pkce: { status: d(S.signedIn), data: {} }, code: { status: d(S.signedIn), data: {} },
-    access: { status: d(S.signedIn), data: { access_token: 'eyJraWQiOiJ4In0.eyJzdWIiOiJ1In0.sig', claims: { sub: 'user', aud: 'gateway' }, header: { alg: 'RS256' }, expiresAt: Date.now() + 3.6e6 } },
+    access: { status: d(S.signedIn), data: { access_token: 'preview-only-not-a-real-token', claims: { sub: 'user', aud: 'gateway' }, header: { alg: 'RS256' }, expiresAt: Date.now() + 3.6e6 } },
     idtoken: { status: d(S.signedIn), data: { id_token: 'eyJ.x.y', claims: {} } }, gateway: { status: gw, data: { calls: [] } },
     sts: { status: past || (S.called ? 'done' : S.consent ? 'waiting' : 'idle'), data: S.called ? { exchange: { result: 'SUCCESS', at: new Date().toISOString() }, oktaGatewayEvents: [{}] } : null },
     ghtoken: { status: past || d(S.called), data: S.called ? { visible: false } : null }, toolcall: { status: past || t, data: { calls: [] } },
