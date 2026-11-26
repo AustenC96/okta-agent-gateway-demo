@@ -1,0 +1,260 @@
+AWSTemplateFormatVersion: '2010-09-09'
+Description: >-
+  Okta Agent Gateway demo: a small Aurora Serverless v2 database (fake CRM and HR data) and two MCP servers (AWS Lambda)
+  behind one API Gateway HTTP API. Deploy with infra/deploy.sh, which also uploads the Lambda code and loads the data.
+
+Parameters:
+  OktaIssuerCrm:
+    Type: String
+    Description: Issuer URL of the "CRM MCP" custom authorization server (printed by `npm run okta -- identity`), e.g. https://your-org.okta.com/oauth2/aus...
+    AllowedPattern: '^https://[^ ]+/oauth2/[A-Za-z0-9]+$'
+  OktaIssuerHr:
+    Type: String
+    Description: Issuer URL of the "HR MCP" custom authorization server.
+    AllowedPattern: '^https://[^ ]+/oauth2/[A-Za-z0-9]+$'
+  AudienceCrm:
+    Type: String
+    Default: api://agw-demo-crm
+    Description: Audience of the CRM authorization server. Tokens for any other audience are refused.
+  AudienceHr:
+    Type: String
+    Default: api://agw-demo-hr
+    Description: Audience of the HR authorization server.
+  ClusterName:
+    Type: String
+    Default: demo-db
+    AllowedPattern: '^[a-z][a-z0-9-]{0,40}$'
+    Description: Name of the Aurora cluster. scripts/preflight.mjs looks for this name unless you set DB_CLUSTER_ID.
+  EngineVersion:
+    Type: String
+    Default: '16.15'
+    Description: Aurora PostgreSQL version. It must support the RDS Data API. Check with `aws rds describe-db-engine-versions --engine aurora-postgresql`.
+  MinCapacity:
+    Type: Number
+    Default: 0
+    AllowedValues: [0, 0.5, 1]
+    Description: Minimum ACUs. 0 lets the database pause when idle (cheapest; the first call after a pause takes about 15 seconds). 0.5 keeps it always on.
+  SecondsUntilAutoPause:
+    Type: Number
+    Default: 3600
+    MinValue: 300
+    MaxValue: 86400
+    Description: Idle time before the database pauses. Only used when MinCapacity is 0.
+  LambdaRuntime:
+    Type: String
+    Default: nodejs24.x
+    Description: Node.js runtime for both MCP servers (the code has no dependencies and needs Node 20 or newer).
+  DbSubnetGroupName:
+    Type: String
+    Default: ''
+    Description: Optional. Leave empty to use the default VPC's subnets (the RDS Data API means nothing connects to the database over the network).
+
+Conditions:
+  HasSubnetGroup: !Not [!Equals [!Ref DbSubnetGroupName, '']]
+  IsPausable: !Equals [!Ref MinCapacity, '0']
+
+Resources:
+  # ---------------- database ----------------
+  Database:
+    Type: AWS::RDS::DBCluster
+    DeletionPolicy: Delete
+    Properties:
+      DBClusterIdentifier: !Ref ClusterName
+      Engine: aurora-postgresql
+      EngineVersion: !Ref EngineVersion
+      MasterUsername: postgres
+      ManageMasterUserPassword: true # Aurora creates the password in Secrets Manager; no password ever touches this template
+      EnableHttpEndpoint: true # the RDS Data API: the Lambdas run SQL over HTTPS with IAM, with no VPC or connection pool
+      StorageEncrypted: true
+      DeletionProtection: false
+      DBSubnetGroupName: !If [HasSubnetGroup, !Ref DbSubnetGroupName, !Ref 'AWS::NoValue']
+      ServerlessV2ScalingConfiguration:
+        MinCapacity: !Ref MinCapacity
+        MaxCapacity: 2
+        SecondsUntilAutoPause: !If [IsPausable, !Ref SecondsUntilAutoPause, !Ref 'AWS::NoValue']
+      Tags:
+        - { Key: Project, Value: agent-gateway-demo }
+
+  DatabaseInstance:
+    Type: AWS::RDS::DBInstance
+    Properties:
+      DBClusterIdentifier: !Ref Database
+      DBInstanceClass: db.serverless
+      Engine: aurora-postgresql
+      Tags:
+        - { Key: Project, Value: agent-gateway-demo }
+
+  # ---------------- one least-privilege role per MCP server ----------------
+  CrmRole:
+    Type: AWS::IAM::Role
+    Properties:
+      AssumeRolePolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - { Effect: Allow, Principal: { Service: lambda.amazonaws.com }, Action: 'sts:AssumeRole' }
+      ManagedPolicyArns:
+        - !Sub 'arn:${AWS::Partition}:iam::aws:policy/service-role/AWSLambdaBasicExecutionRole' # CloudWatch Logs only
+      Policies:
+        - PolicyName: data-access
+          PolicyDocument:
+            Version: '2012-10-17'
+            Statement:
+              - { Effect: Allow, Action: 'rds-data:ExecuteStatement', Resource: !GetAtt Database.DBClusterArn }
+              - { Effect: Allow, Action: 'secretsmanager:GetSecretValue', Resource: !GetAtt Database.MasterUserSecret.SecretArn }
+      Tags:
+        - { Key: Project, Value: agent-gateway-demo }
+
+  HrRole:
+    Type: AWS::IAM::Role
+    Properties:
+      AssumeRolePolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - { Effect: Allow, Principal: { Service: lambda.amazonaws.com }, Action: 'sts:AssumeRole' }
+      ManagedPolicyArns:
+        - !Sub 'arn:${AWS::Partition}:iam::aws:policy/service-role/AWSLambdaBasicExecutionRole'
+      Policies:
+        - PolicyName: data-access
+          PolicyDocument:
+            Version: '2012-10-17'
+            Statement:
+              - { Effect: Allow, Action: 'rds-data:ExecuteStatement', Resource: !GetAtt Database.DBClusterArn }
+              - { Effect: Allow, Action: 'secretsmanager:GetSecretValue', Resource: !GetAtt Database.MasterUserSecret.SecretArn }
+      Tags:
+        - { Key: Project, Value: agent-gateway-demo }
+
+  # ---------------- the two MCP servers ----------------
+  # The code is uploaded by infra/deploy.sh (it zips infra/mcp/ and points the handler at crm.handler / hr.handler).
+  # Until then each function holds a stub that says so, which keeps this template free of any build step or S3 bucket.
+  CrmFunction:
+    Type: AWS::Lambda::Function
+    DependsOn: DatabaseInstance
+    Properties:
+      FunctionName: agw-demo-crm-mcp
+      Description: CRM MCP server for the Okta Agent Gateway demo
+      Runtime: !Ref LambdaRuntime
+      Architectures: [arm64]
+      Handler: index.handler
+      Role: !GetAtt CrmRole.Arn
+      Timeout: 29 # API Gateway gives up at 29 seconds, so a longer timeout would only hide the real error
+      MemorySize: 256
+      Code:
+        ZipFile: "exports.handler = async () => ({ statusCode: 503, body: 'Code not uploaded yet: run infra/deploy.sh' });"
+      Environment:
+        Variables:
+          OKTA_ISSUER: !Ref OktaIssuerCrm
+          AUDIENCE: !Ref AudienceCrm
+          MOUNT_PATH: /crm
+          DB_CLUSTER_ARN: !GetAtt Database.DBClusterArn
+          DB_SECRET_ARN: !GetAtt Database.MasterUserSecret.SecretArn
+          DB_NAME: postgres
+      Tags:
+        - { Key: Project, Value: agent-gateway-demo }
+
+  HrFunction:
+    Type: AWS::Lambda::Function
+    DependsOn: DatabaseInstance
+    Properties:
+      FunctionName: agw-demo-hr-mcp
+      Description: HR MCP server for the Okta Agent Gateway demo
+      Runtime: !Ref LambdaRuntime
+      Architectures: [arm64]
+      Handler: index.handler
+      Role: !GetAtt HrRole.Arn
+      Timeout: 29
+      MemorySize: 256
+      Code:
+        ZipFile: "exports.handler = async () => ({ statusCode: 503, body: 'Code not uploaded yet: run infra/deploy.sh' });"
+      Environment:
+        Variables:
+          OKTA_ISSUER: !Ref OktaIssuerHr
+          AUDIENCE: !Ref AudienceHr
+          MOUNT_PATH: /hr
+          DB_CLUSTER_ARN: !GetAtt Database.DBClusterArn
+          DB_SECRET_ARN: !GetAtt Database.MasterUserSecret.SecretArn
+          DB_NAME: postgres
+      Tags:
+        - { Key: Project, Value: agent-gateway-demo }
+
+  CrmLogs:
+    Type: AWS::Logs::LogGroup
+    Properties: { LogGroupName: /aws/lambda/agw-demo-crm-mcp, RetentionInDays: 14 }
+  HrLogs:
+    Type: AWS::Logs::LogGroup
+    Properties: { LogGroupName: /aws/lambda/agw-demo-hr-mcp, RetentionInDays: 14 }
+
+  # ---------------- one public HTTPS front door ----------------
+  # API Gateway (not a Lambda Function URL) because it passes the WWW-Authenticate header through untouched, and MCP clients need it
+  # to discover which authorization server to use. Okta, not API Gateway, decides who may call: the Lambda verifies every token itself.
+  Api:
+    Type: AWS::ApiGatewayV2::Api
+    Properties:
+      Name: agw-demo-mcp
+      ProtocolType: HTTP
+      Tags: { Project: agent-gateway-demo }
+
+  Stage:
+    Type: AWS::ApiGatewayV2::Stage
+    Properties:
+      ApiId: !Ref Api
+      StageName: $default
+      AutoDeploy: true
+      DefaultRouteSettings:
+        ThrottlingBurstLimit: 20 # a demo needs a trickle; this caps the cost of anyone hammering the public URL
+        ThrottlingRateLimit: 10
+
+  CrmIntegration:
+    Type: AWS::ApiGatewayV2::Integration
+    Properties:
+      ApiId: !Ref Api
+      IntegrationType: AWS_PROXY
+      IntegrationUri: !GetAtt CrmFunction.Arn
+      PayloadFormatVersion: '2.0'
+  HrIntegration:
+    Type: AWS::ApiGatewayV2::Integration
+    Properties:
+      ApiId: !Ref Api
+      IntegrationType: AWS_PROXY
+      IntegrationUri: !GetAtt HrFunction.Arn
+      PayloadFormatVersion: '2.0'
+
+  CrmRoute:
+    Type: AWS::ApiGatewayV2::Route
+    Properties: { ApiId: !Ref Api, RouteKey: 'ANY /crm', Target: !Sub 'integrations/${CrmIntegration}' }
+  CrmMetadataRoute:
+    Type: AWS::ApiGatewayV2::Route
+    Properties: { ApiId: !Ref Api, RouteKey: 'GET /.well-known/oauth-protected-resource/crm', Target: !Sub 'integrations/${CrmIntegration}' }
+  HrRoute:
+    Type: AWS::ApiGatewayV2::Route
+    Properties: { ApiId: !Ref Api, RouteKey: 'ANY /hr', Target: !Sub 'integrations/${HrIntegration}' }
+  HrMetadataRoute:
+    Type: AWS::ApiGatewayV2::Route
+    Properties: { ApiId: !Ref Api, RouteKey: 'GET /.well-known/oauth-protected-resource/hr', Target: !Sub 'integrations/${HrIntegration}' }
+
+  CrmInvokePermission:
+    Type: AWS::Lambda::Permission
+    Properties:
+      Action: lambda:InvokeFunction
+      FunctionName: !Ref CrmFunction
+      Principal: apigateway.amazonaws.com
+      SourceArn: !Sub 'arn:${AWS::Partition}:execute-api:${AWS::Region}:${AWS::AccountId}:${Api}/*'
+  HrInvokePermission:
+    Type: AWS::Lambda::Permission
+    Properties:
+      Action: lambda:InvokeFunction
+      FunctionName: !Ref HrFunction
+      Principal: apigateway.amazonaws.com
+      SourceArn: !Sub 'arn:${AWS::Partition}:execute-api:${AWS::Region}:${AWS::AccountId}:${Api}/*'
+
+Outputs:
+  McpApiUrl:
+    Description: Public base URL of both MCP servers. Register it in Okta (npm run okta -- connect --api-url ...). The servers are at /crm and /hr.
+    Value: !GetAtt Api.ApiEndpoint
+  DbClusterArn:
+    Description: Goes in .env as DB_CLUSTER_ARN
+    Value: !GetAtt Database.DBClusterArn
+  DbSecretArn:
+    Description: Goes in .env as DB_SECRET_ARN (an identifier, not the password)
+    Value: !GetAtt Database.MasterUserSecret.SecretArn
+  ClusterName:
+    Value: !Ref ClusterName

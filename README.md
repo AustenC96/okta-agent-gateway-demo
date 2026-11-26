@@ -1,86 +1,84 @@
-# Okta Agent Gateway: interactive flow demo
+# Okta Agent Gateway demo
 
-A small local web app that walks through an AI agent reaching GitHub **through Okta Agent Gateway**, and shows
-every call and token as it happens: a 4-step walkthrough, a live trace of real requests and responses, and a
-clickable token-flow diagram (discover, PKCE, auth code, access token, ID token, gateway, Okta token exchange,
-GitHub token, tool call).
+An interactive demo of **Okta Agent Gateway**: three fictional employees, each using their own team's AI agent, each agent reaching
+only their own team's tools through a gateway, with Okta's System Log as the evidence for every decision.
 
-It builds on the **Agent Gateway** managed component from the demo platform. The component creates the gateway,
-the AI agent and the GitHub connection; this app is a front end that plays the agent's role against that gateway.
+| Person | Team | Their agent | Their gateway | Tools behind it |
+|---|---|---|---|---|
+| Ethan Park | Engineering | Engineering Agent | Engineering Tools | GitHub MCP server |
+| Sofia Reyes | Sales | Sales Agent | Sales Tools | CRM MCP server (AWS Lambda + Aurora) |
+| Hannah Cho | HR | HR Agent | HR Resources | HR MCP server (AWS Lambda + Aurora) |
 
-## Prerequisites
+Pick a person, walk the agent through **Discover → Sign in → Connect → Use tools**, then try to break it. Every answer is a plain verdict:
 
-1. A demo org with the Agent Gateway component attached and working. Complete **Parts 1-4** of the
-   *Demo Guide: Okta Agent Gateway* (GitHub App, API token, attach, GitHub consent, discover tools).
-   You do not need Claude Code (Part 5) for this app.
-2. Node.js 20 or newer.
+| Verdict | Who decided | How to trigger it |
+|---|---|---|
+| **Allowed** | Okta issued a scoped token and the tool ran | Run any tool the person's team owns |
+| **Blocked by Okta** | The sign-in itself was refused | Sign the same person in to *another team's* agent |
+| **Blocked by the gateway** | The tool is not on the gateway's list | Ask for a tool from another team (the page has buttons for this) |
+| **One-time consent needed** | The person has not yet approved the downstream service | The first tool call of a new user |
 
-## Setup
+It is a local web app (Node + Express) that plays the agent's part, plus the AWS and Okta pieces it talks to. Nothing is mocked:
+the tokens, the gateway, the MCP servers and the database are real, and the "Under the hood" drawer shows each request and token.
 
-### 1. Okta: check the agent app
-In the Admin Console open the agent's OIDC app (named like "Agent Gateway Agent") and confirm **Sign-in redirect
-URIs** includes `http://localhost:8080/authorization-code/callback`. Add it if it is missing.
+> **Status.** Okta Agent Gateway and its APIs are a Research Release (Beta) and may change. This repo is a demo, not production code.
 
-### 2. Optional: limit the gateway to read-only tools
-The sample inputs only use `get_me`, `search_repositories` and `get_file_contents`. Disabling the other
-discovered tools in the gateway's capability list is a good way to also show tool-level governance.
+## Set it up in your own environment
 
-### 3. Configure
+You need an Okta org with Agent Gateway enabled (with a super-admin API token), an AWS account, and Node 20+. About 45 minutes, most of it waiting
+for the database to be created.
+
 ```sh
-cp .env.example .env
-```
-Fill in `.env` from the component: `GATEWAY_URL` from **Deployment Data**, `CLIENT_ID` and `CLIENT_SECRET` from the
-**Credentials** panel, `OKTA_ORG_URL` from your org (`https://<name>.oktapreview.com` or `https://<name>.okta.com`). Treat the client secret like a password.
-
-Optional: set `OKTA_API_TOKEN` (the token from Part 1 works) so the app can read Okta's System Log and turn the
-"Okta token exchange" and "GitHub token" stages green from real evidence. Without it those stages stay blue
-("inferred"). Revoke the token when you are done.
-
-### 4. Run
-```sh
+git clone https://github.com/AustenC96/okta-agent-gateway-demo.git && cd okta-agent-gateway-demo
 npm install
-npm start
+cp .env.example .env             # then set OKTA_ORG_URL and OKTA_API_TOKEN
+
+npm run okta -- identity --add-me                       # 1. groups, three fictional users, two custom authorization servers
+infra/deploy.sh --crm-issuer <url> --hr-issuer <url>    # 2. AWS: database, two MCP servers, API Gateway (URLs printed by step 1)
+npm run okta -- connect --api-url <McpApiUrl>           # 3. MCP servers, gateways, tools, agents (URL printed by step 2)
+npm run okta -- env                                     # 4. prints the .env lines for the agents; add the AWS lines step 2 printed
+npm run preflight                                       # 5. checks everything, wakes the database, starts the app
 ```
-Open http://localhost:8080 and follow the steps. Sign in as a user assigned to the agent app (the demo owner is
-assigned automatically).
 
-## Three-team version: personas, gateways and real data
+The full walkthrough, with what each step does, what to expect and the one manual part (the GitHub App for Ethan), is in
+**[docs/SETUP.md](docs/SETUP.md)**.
 
-The app can also show **who may reach what** across three teams. The home screen is an account chooser (Ethan in Engineering,
-Sofia in Sales, Hannah in HR). Each person signs in through **their own team's agent**, which reaches **their own team's gateway**:
+| Document | What it covers |
+|---|---|
+| [docs/SETUP.md](docs/SETUP.md) | Prerequisites and every setup step, with checks after each |
+| [docs/ARCHITECTURE.md](docs/ARCHITECTURE.md) | How a request flows, what each layer enforces, every object that gets created |
+| [docs/PRESENTING.md](docs/PRESENTING.md) | A 10-minute talk track, what to say, what can go wrong live |
+| [docs/TROUBLESHOOTING.md](docs/TROUBLESHOOTING.md) | Symptoms, causes and fixes |
+| [SECURITY.md](SECURITY.md) | What is and is not secret here, and how to clean up |
 
-| Persona | Agent | Gateway | Behind it |
-|---|---|---|---|
-| Ethan Park (Engineering) | Engineering Agent | Engineering Tools | GitHub MCP server |
-| Sofia Reyes (Sales) | Sales Agent | Sales Tools | CRM MCP server (Aurora) |
-| Hannah Cho (HR) | HR Agent | HR Resources | HR MCP server (Aurora) |
+## Commands
 
-After signing in, each page answers the last thing you tried with a plain verdict (**Allowed**, **Blocked by Okta**, **Blocked
-by the gateway**, **One-time consent needed**), backed by Okta's own System Log. Two checks try to break it: sign the same
-person in to another team's agent (stopped by Okta), and ask for a tool their gateway does not list (stopped by the gateway).
+| Command | Purpose |
+|---|---|
+| `npm start` | Run the app at http://localhost:8080 |
+| `npm run preflight` | Before a session: checks Okta, AWS and `.env`, wakes the database, resets the deals, restarts the app. `-- --check` changes nothing |
+| `npm run okta -- status` | Read-only: lists which Okta objects exist and which are missing |
+| `npm run okta -- teardown` | Removes the Okta objects the demo created |
+| `npm run seed` | Loads the fictional data (`-- --reset` reloads it) |
+| `npm run warm` | Wakes the paused database |
+| `npm test` | 83 offline tests (no Okta, AWS or network needed) |
+| `node scripts/preview.mjs /tmp/preview` | Renders every screen to PNG in headless Chrome against a fake backend |
 
-Set these in your shell or `.env` (the original `OKTA_ORG_URL`, `GATEWAY_URL`, `CLIENT_ID` still describe the Engineering persona):
-`SALES_AGENT_CLIENT_ID`, `SALES_AGENT_CLIENT_SECRET`, `HR_AGENT_CLIENT_ID`, `HR_AGENT_CLIENT_SECRET`. A persona whose settings are
-missing is shown as "not set up". Gateway paths are `sales-tools` and `hr-resources` on the same gateway host (see `personas.js`).
+## Repository map
 
-`infra/` holds the two demo MCP servers (`infra/mcp/`, AWS Lambda behind API Gateway, no dependencies) and the fake CRM and HR
-data (`infra/db/`, Aurora PostgreSQL through the RDS Data API). Each server verifies the Okta access token and checks its scopes.
-Build the Lambda zip with `./infra/build.sh`; load data with `node infra/db/run-sql.mjs infra/db/01-schema.sql`. Aurora can
-pause when idle, so run `npm run warm` a few minutes before a session.
-
-To review the interface without signing in to anything: `node scripts/preview.mjs /tmp/preview` renders each state in
-headless Chrome against a fake backend and saves screenshots.
-
-## Tests
-```sh
-npm test
 ```
-Runs without any Okta org or network access: it starts the app on a random port against local stub servers. It covers
-trace isolation between visitors, personas and their sign-in, the wrong-agent check, verdicts, redirect URI handling, the System
-Log user filter, URL safety checks, and the CRM and HR MCP servers (token checks, scopes, database wake-up).
+server.js, personas.js, verdicts.js, config.js   the app: sign-in, MCP calls, verdicts, System Log evidence
+public/                                          the web page
+infra/aws/template.yaml                          CloudFormation: Aurora Serverless v2, two Lambdas, API Gateway
+infra/mcp/                                       the two MCP servers (no dependencies); core.mjs verifies tokens and scopes
+infra/db/                                        fictional CRM and HR data and its loader
+infra/deploy.sh                                  one command to deploy all of AWS
+scripts/okta-bootstrap.mjs                       creates, checks and removes the Okta objects
+scripts/preflight.mjs                            the before-you-present check
+test/                                            offline tests
+docs/                                            setup, architecture, presenting, troubleshooting
+```
 
-## Notes and limits
-- The gateway and Virtual MCP APIs are Research Release (Beta) and may change.
-- Narration is generated from the real responses; there is no LLM involved.
-- This is a demo: sessions are in memory, there is no TLS, and it should only be run on localhost.
-- Never commit `.env`.
+## License
+
+[MIT](LICENSE). All people, companies and data in this demo are fictional.

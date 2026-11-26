@@ -1,16 +1,28 @@
 {
-  "name": "agent-gateway-demo",
+  "name": "okta-agent-gateway-demo",
   "version": "1.0.0",
-  "private": true,
   "type": "module",
   "scripts": {
     "start": "node server.js",
     "test": "node --test \"test/*.test.js\"",
-    "warm": "node scripts/warm-db.mjs"
+    "warm": "node scripts/warm-db.mjs",
+    "preflight": "node scripts/preflight.mjs",
+    "seed": "node infra/db/load.mjs",
+    "okta": "node scripts/okta-bootstrap.mjs"
   },
   "dependencies": {
     "dotenv": "^16.4.5",
     "express": "^4.19.2",
     "express-session": "^1.18.0"
-  }
+  },
+  "description": "Interactive demo of Okta Agent Gateway: three teams, their agents, gateways and MCP servers, with Okta System Log evidence",
+  "license": "MIT",
+  "engines": {
+    "node": ">=20"
+  },
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/AustenC96/okta-agent-gateway-demo.git"
+  },
+  "private": true
 }
