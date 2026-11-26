@@ -222,12 +222,12 @@ pre{margin:0;max-height:260px;overflow:auto;background:#0a0c11;border:1px solid 
 @media (max-width:1100px){.cols{grid-template-columns:1fr}body{overflow:auto}.pathRow{grid-template-columns:1fr}.pArrow{display:none}.stepper{flex-wrap:wrap}}
 
 /* chat: a centred message column, tool use as collapsible step rows, a pinned composer */
-.chatPane{display:flex;flex-direction:column;background:var(--panel);border:1px solid var(--line);border-radius:16px;overflow:hidden;min-height:560px;max-height:calc(100vh - 250px)}
+.chatPane{display:flex;flex-direction:column;background:var(--panel);border:1px solid var(--line);border-radius:16px;overflow:hidden;flex:1 1 auto;min-height:420px}
 .chatHead{padding:14px 20px;border-bottom:1px solid var(--line)}
 .chatTitle{display:flex;gap:12px;align-items:center}
 .chatTitle>svg{width:28px;height:28px;padding:5px;border-radius:9px;background:#6c8cff22;color:var(--accent)}
 .chatTitle b{display:block;font-size:15px}.chatTitle span{color:var(--mute);font-size:12.5px}
-.chatLog{flex:1;overflow:auto;padding:20px;display:flex;flex-direction:column;gap:18px;scroll-behavior:smooth}
+.chatLog{flex:1;min-height:0;overflow:auto;padding:20px;display:flex;flex-direction:column;gap:18px;scroll-behavior:smooth}
 .chatEmpty{margin:auto;text-align:center;max-width:380px}.chatEmpty h3{font-size:20px;letter-spacing:-.01em;margin-bottom:6px}.chatEmpty p{margin:0;color:var(--mute)}
 .row.you{display:flex;justify-content:flex-end}
 .bubble{background:#2b3a67;padding:10px 14px;border-radius:16px 16px 4px 16px;max-width:80%;white-space:pre-wrap}
@@ -278,3 +278,11 @@ details.step summary code{font-family:var(--mono);font-size:11.5px;color:var(--m
 .stageStrip .sg-pass{color:var(--ok);border-color:#3ddc9744;background:#3ddc970d}
 .stageStrip .sg-stop{color:var(--bad);border-color:#ff6b7a77;background:#ff6b7a14;font-weight:650}
 .stageStrip .sg-wait{color:var(--warn);border-color:#ffb45477;background:#ffb45414;font-weight:650}
+
+/* locked: the person tried another team's agent and Okta refused */
+.chatPane.locked{border-color:#ff6b7a66;background:linear-gradient(180deg,#1d1216,var(--panel))}
+.chatPane.locked .chatLog,.chatPane.locked .chips,.chatPane.locked .composer,.chatPane.locked .chatNote{display:none}
+.chatPane.locked .chatTitle>svg{background:#ff6b7a22;color:var(--bad)}
+.lockedView{flex:1;display:grid;place-content:center;justify-items:center;text-align:center;gap:8px;padding:30px;max-width:460px;margin:0 auto}
+.lockedView .lockBig{width:56px;height:56px;border-radius:50%;display:grid;place-items:center;background:#ff6b7a22;color:var(--bad);font-size:26px;margin-bottom:6px}
+.lockedView h3{font-size:22px;letter-spacing:-.01em}.lockedView p{margin:0;color:var(--mute)}.lockedView button{margin-top:10px}

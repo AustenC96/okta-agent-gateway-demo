@@ -185,7 +185,23 @@ function renderChat() {
   const on = !!(me?.chat && state.cfg?.signedIn);
   box.hidden = !on;
   if (!on) { delete box.dataset.ready; pendingConsent = null; chatBusy = false; return; }
-  if (box.dataset.ready) return;
+  // When the person tried another team's agent and Okta refused, the chat shows THAT agent as locked, so the page reflects who they tried to reach.
+  const v = state.verdict, lock = v?.kind === 'blocked-okta' && v.target && state.dismissedProbe !== v ? v : null;
+  const syncLock = () => {
+    const first = me.name.split(' ')[0];
+    box.classList.toggle('locked', !!lock);
+    const title = box.querySelector('.chatTitle');
+    if (title) title.innerHTML = lock ? `${icon('lock')}<div><b>${esc(lock.target.agent)}</b><span>Not available to ${esc(first)}</span></div>` : `${icon('agent')}<div><b>${esc(me.agent)}</b><span>Acting for ${esc(first)} · Claude on Amazon Bedrock AgentCore</span></div>`;
+    let panel = box.querySelector('.lockedView');
+    if (!lock) { panel?.remove(); return; }
+    if (!panel) { panel = document.createElement('div'); panel.className = 'lockedView'; box.insertBefore(panel, box.querySelector('.chatLog')); }
+    panel.innerHTML = `<div class="lockBig">${icon('lock')}</div><h3>Okta wouldn’t let ${esc(first)} in</h3>
+      <p>${esc(lock.detail || `${me.name} is not assigned to the ${lock.target.agent}.`)} Okta refused the sign-in before the agent saw a single message.</p>
+      <p>${esc(lock.target.gateway || 'Its gateway')}${lock.target.resource ? ` and the ${esc(lock.target.resource)} behind it` : ''} stay out of reach.</p>
+      <button type="button" class="outline" id="backBtn">Back to the ${esc(me.agent)}</button>`;
+    panel.querySelector('#backBtn').onclick = () => { state.dismissedProbe = lock; renderChat(); };
+  };
+  if (box.dataset.ready) { syncLock(); return; }
   box.dataset.ready = '1';
   const first = me.name.split(' ')[0], chips = me.chips || { ask: [], breakIt: [] };
   const others = (state.cfg?.personas || []).filter((p) => p.configured && p.key !== me.key);
@@ -290,7 +306,8 @@ function renderChat() {
   $('#composer').onsubmit = (e) => { e.preventDefault(); submit(input.value); };
   box.querySelectorAll('.chip[data-p]').forEach((b) => b.onclick = () => submit(b.dataset.p));
   window.addEventListener('focus', () => { if (pendingConsent?.opened) retry(); });
-  input.focus();
+  syncLock();
+  if (!lock) input.focus();
 }
 const prettyTool = (t) => { const s = baseName(t).replace(/_/g, ' '); return s.charAt(0).toUpperCase() + s.slice(1); };
 
@@ -305,6 +322,7 @@ const ICON = {
   alert: '<circle cx="12" cy="12" r="9"/><path d="M12 7.5v5M12 16h.01"/>',
   log: '<path d="M6 3h9l4 4v14H6z"/><path d="M9 12h7M9 16h7M9 8h3"/>',
   shield: '<path d="M12 3l8 3v6c0 5-3.5 8-8 9-4.5-1-8-4-8-9V6z"/>',
+  lock: '<rect x="5" y="11" width="14" height="9" rx="2"/><path d="M8 11V8a4 4 0 018 0v3"/>',
 };
 const icon = (n) => `<svg class="i" viewBox="0 0 24 24" aria-hidden="true">${ICON[n]}</svg>`;
 // Each stop is idle, active (the next thing to do), ok, wait (needs the user) or blocked. They come from what the server observed.
