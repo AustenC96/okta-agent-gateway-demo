@@ -152,7 +152,8 @@ const ERRORS = [];
 ws.addEventListener('message', (m) => { const d = JSON.parse(m.data); if (d.method === 'Runtime.exceptionThrown') ERRORS.push(d.params.exceptionDetails.exception?.description?.split('\n')[0] || d.params.exceptionDetails.text); if (d.method === 'Runtime.consoleAPICalled' && d.params.type === 'error') ERRORS.push(d.params.args.map((x) => x.value || x.description).join(' ')); });
 const SCENARIOS = {
   async picker() { reset(); await open(); await shot('01-picker'); },
-  async start() { reset(); await open(); await choose('sofia'); await shot('02-sign-in'); },
+  // Also clicks the button: the page must call discovery and then head for /auth/login (the fake backend answers discovery; Chrome then leaves for the real path).
+  async start() { reset(); await open(); await choose('sofia'); await shot('02-sign-in'); await click('#go'); await sleep(1200); console.log('after Sign in, the page is at:', await ev$('location.pathname')); },
   async chat() { reset(); await open(); await choose('sofia'); await signIn(); await shot('03-chat-empty'); },
   async allowed() { await SCENARIOS.chat(); await click('.chip[data-p]', 0); await sleep(1500); await shot('04-chat-allowed'); },
   async blocked() { await SCENARIOS.chat(); await click('.chip.warn[data-p]', 0); await sleep(1500); await shot('05-chat-blocked'); },
@@ -165,3 +166,4 @@ const SCENARIOS = {
 try {
   for (const name of (WANT.length ? WANT : Object.keys(SCENARIOS).filter((n) => n !== 'real'))) { console.log('scenario', name); await SCENARIOS[name](); }
 } finally { ws.close(); proc.kill(); }
+if (ERRORS.length) { console.error('PAGE ERRORS (the page threw while being driven):\n  ' + [...new Set(ERRORS)].join('\n  ')); process.exitCode = 1; }

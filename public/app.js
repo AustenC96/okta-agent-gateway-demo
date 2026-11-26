@@ -210,7 +210,7 @@ function renderChat() {
   function addAgent() {
     clearEmpty();
     const row = document.createElement('div'); row.className = 'row agent';
-    row.innerHTML = `<div class="avatar">${icon('agent')}</div><div class="body"><div class="steps"></div><div class="answer"></div><div class="thinking"><i></i><i></i><i></i></div></div>`;
+    row.innerHTML = `<div class="agentAvatar">${icon('agent')}</div><div class="body"><div class="steps"></div><div class="answer"></div><div class="thinking"><i></i><i></i><i></i></div></div>`;
     log.appendChild(row); scroll();
     return { row, steps: row.querySelector('.steps'), answer: row.querySelector('.answer'), thinking: row.querySelector('.thinking'), text: '' };
   }
@@ -346,19 +346,15 @@ function renderPath() {
 $('#path').addEventListener('click', (e) => { if (e.target.closest('.oktaBar')) setDrawer(true); });
 
 // ---------- the verdict: one plain answer to the last thing that was tried ----------
-function preview(text) {
-  let data; try { data = JSON.parse(text); } catch { return text ? `<pre>${esc(text.slice(0, 700))}</pre>` : ''; }
-  const cell = (v) => (v && typeof v === 'object' ? JSON.stringify(v) : String(v ?? ''));
-  const pretty = (k) => k.replace(/_/g, ' ');
-  const kv = (o) => `<dl class="kvgrid">${Object.entries(o).slice(0, 8).map(([k, v]) => `<dt>${esc(pretty(k))}</dt><dd title="${esc(cell(v))}">${esc(cell(v))}</dd>`).join('')}</dl>`;
-  if (Array.isArray(data) && data.length === 1 && data[0] && typeof data[0] === 'object') return kv(data[0]);
-  if (Array.isArray(data) && data.length && data.every((x) => x && typeof x === 'object' && !Array.isArray(x))) {
-    const cols = Object.keys(data[0]).slice(0, 5);
-    return `<div class="tbl"><table><thead><tr>${cols.map((c) => `<th>${esc(pretty(c))}</th>`).join('')}</tr></thead><tbody>${data.slice(0, 5).map((r) => `<tr>${cols.map((c) => `<td title="${esc(cell(r[c]))}">${esc(cell(r[c]))}</td>`).join('')}</tr>`).join('')}</tbody></table>${data.length > 5 ? `<div class="more">+${data.length - 5} more rows</div>` : ''}</div>`;
-  }
-  if (data && typeof data === 'object' && !Array.isArray(data)) return kv(data);
-  return `<pre>${esc(String(text).slice(0, 700))}</pre>`;
+// Where in the path a request was decided. Each verdict says how far the request got: passed every stage before the one that decided, stopped at it, never reached the rest.
+const STAGES = ['Okta sign-in', 'Gateway', 'Token exchange', 'MCP server'];
+function stagesFor(v) {
+  const at = { allowed: 4, 'blocked-okta': 0, 'blocked-gateway': 1, consent: 2, 'blocked-server': 3, waking: 3 }[v.kind];
+  if (at === undefined) return null; // an unexplained failure: do not claim a stage
+  const stop = v.kind === 'allowed' ? -1 : at;
+  return STAGES.map((label, i) => ({ label, st: stop < 0 || i < stop ? 'pass' : i === stop ? (v.kind === 'consent' || v.kind === 'waking' ? 'wait' : 'stop') : 'skip' }));
 }
+const STAGE_ICON = { pass: 'check', stop: 'shieldx', wait: 'alert', skip: '' };
 function renderVerdict() {
   const el = $('#verdict'), v = state.verdict;
   if (!v) {
@@ -367,10 +363,10 @@ function renderVerdict() {
     return;
   }
   const ic = { allowed: 'check', consent: 'alert', waking: 'alert', problem: 'alert' }[v.kind] || 'shieldx';
-  const text = (v.body?.result?.content || []).map((c) => c.text).filter(Boolean).join('\n');
+  const sg = stagesFor(v);
   el.className = `card verdict v-${v.kind}`;
   el.innerHTML = `<div class="vHead"><div class="vIcon">${icon(ic)}</div><div><div class="vTitle">${esc(v.title)}</div><div class="vDetail">${esc(v.detail || '')}</div></div></div>
-    ${v.kind === 'allowed' && text ? preview(text) : ''}
+    ${sg ? `<ol class="stageStrip" aria-label="Where this was decided">${sg.map((x) => `<li class="sg-${x.st}">${x.st === 'skip' ? '<i></i>' : icon(STAGE_ICON[x.st])}<span>${esc(x.label)}</span></li>`).join('')}</ol>` : ''}
     ${v.kind === 'consent' && v.url ? `<div><a class="btn" href="${esc(v.url)}" target="_blank" rel="noopener">Open the consent page →</a></div>` : ''}
     ${v.evidence ? `<div class="evidence">${icon('log')}<span>${esc(v.evidence)}</span></div>` : ''}`;
 }
@@ -426,6 +422,7 @@ function sampleArgs(tool) {
   for (const k of ['perPage', 'per_page']) if (k in props && !(k in args)) args[k] = 3; // keep the answer short
   return args;
 }
+async function run(fn) { state.busy = true; render(); try { await fn(); } finally { state.busy = false; await load(); } }
 async function load() {
   state.cfg = await api('/api/config');
   state.discovered = state.cfg.discovered;
